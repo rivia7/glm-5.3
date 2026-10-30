@@ -73,7 +73,7 @@ BIOS 设置和系统软件（驱动、RDMA 库、CUDA Toolkit）仍要按 0b 手
 docker run -d --name glm53 --gpus all --network host --ipc host --shm-size 32g \
   --ulimit memlock=-1 --ulimit stack=67108864 \
   --device /dev/infiniband --cap-add IPC_LOCK \
-  -v /data/models:/data/models -v "$PWD":/work -w /work \
+  -v /home/test/ext_module:/home/test/ext_module -v "$PWD":/work -w /work \
   lmsysorg/sglang:latest sleep infinity
 docker exec -it glm53 bash
 ```
