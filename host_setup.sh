@@ -2,7 +2,7 @@
 # =====================================================================
 # 裸机宿主机准备（两台机器各执行一次）
 #
-#   ./host_setup.sh            只检查，列出会改什么（不需要 root）
+#   ./host_setup.sh            只检查，列出会改什么（防火墙和 ACS 要用 sudo 运行才能检查）
 #   sudo ./host_setup.sh --apply   实际修改
 #
 # 会改的项目（都可以安全重复执行）：
@@ -28,6 +28,8 @@ if [[ $APPLY == 1 && $EUID -ne 0 ]]; then die "--apply 需要 root（sudo ./host
 have()    { command -v "$1" >/dev/null 2>&1; }
 section() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 NTODO=0
+NSKIP=0
+skip() { warn "$*"; NSKIP=$((NSKIP + 1)); }  # 权限或工具不够、没能检查的项
 todo() {  # 需要修改的项：检查模式只打印，--apply 模式执行
   local desc="$1"; shift
   if [[ $APPLY == 1 ]]; then
@@ -86,7 +88,7 @@ else
   todo "写 $LIMITS（memlock 不限，重新登录后生效）" \
     write_file "$LIMITS" $'*    soft    memlock    unlimited\n*    hard    memlock    unlimited'
 fi
-info "当前会话 memlock = $(ulimit -l)（用 systemd 启动时由 glm53@.service 里的 LimitMEMLOCK 控制）"
+info "当前会话 memlock = $(ulimit -l)"
 
 # ---------------------------------------------------------------------
 section "4. NUMA 自动均衡"
@@ -120,6 +122,9 @@ section "6. 防火墙"
 PEER="$(peer_ip)"
 if [[ -z $PEER ]]; then
   warn "$NET_IFNAME 上的 IP 既不是 NODE0_ADDR 也不是 NODE1_ADDR，无法确定对端，跳过"
+elif [[ $EUID -ne 0 ]]; then
+  # 非 root 时 ufw status 直接报错，会被误判成没有防火墙
+  skip "查看防火墙规则需要 root，跳过"
 elif have ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
   if ufw status 2>/dev/null | grep -qwF "$PEER"; then
     ok "ufw 已有放行 $PEER 的规则"
@@ -156,7 +161,7 @@ if [[ $EUID -eq 0 ]] && have lspci; then
     ok "没有 PCIe 桥开启 ACS"
   fi
 else
-  info "检查 ACS 需要 root 和 lspci，跳过（sudo 再跑一次可以看到）"
+  skip "检查 ACS 需要 root 和 lspci，跳过"
 fi
 info "BIOS 里还应确认：Above 4G Decoding 与 Resizable BAR 已开启"
 
@@ -166,6 +171,9 @@ if [[ $APPLY == 1 ]]; then
   ok "已执行完毕。memlock 需要重新登录才生效；IOMMU/ACS 需要手动处理"
 elif ((NTODO)); then
   warn "$NTODO 项待修改，确认后执行：sudo ./host_setup.sh --apply"
-else
+elif ((NSKIP == 0)); then
   ok "无需修改"
+fi
+if ((NSKIP)); then
+  warn "$NSKIP 项没有检查（见上面的 WARN），用 sudo ./host_setup.sh 再看一次"
 fi

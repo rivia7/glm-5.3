@@ -26,7 +26,9 @@ if [[ $(rdma_link_layer) == Ethernet ]]; then
   ARGS+=(-x "${IB_GID_INDEX:-3}")
 fi
 if [[ -n $GPU ]]; then
-  if ib_write_bw --help 2>&1 | grep -q -- '--use_cuda'; then
+  # --help 的退出码不是 0，开着 pipefail 时不能直接接 grep
+  help_text="$(ib_write_bw --help 2>&1 || true)"
+  if grep -q -- '--use_cuda' <<<"$help_text"; then
     ARGS+=("--use_cuda=$GPU")
   else
     die "这个 perftest 没有 CUDA 支持，无法测 GPUDirect；可以只测主机内存，GPUDirect 交给 run_nccl_test.sh 判断"

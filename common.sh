@@ -3,6 +3,13 @@
 _COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=cluster.env
 source "$_COMMON_DIR/cluster.env"
+# deploy.sh 通过环境变量覆盖裸机设置：GLM53_PY_ENV 来自 --py-env；在容器里两项都置空，用镜像自带的 Python 和 CUDA
+if [[ -n ${GLM53_PY_ENV+x} ]]; then PY_ENV="$GLM53_PY_ENV"; fi
+if [[ -n ${GLM53_CUDA_HOME+x} ]]; then CUDA_HOME="$GLM53_CUDA_HOME"; fi
+# PY_ENV 可以写虚拟环境目录，也可以写它的 bin/activate
+PY_ENV="${PY_ENV:-}"
+PY_ENV="${PY_ENV%/}"
+PY_ENV="${PY_ENV%/bin/activate}"
 
 info() { printf '\033[36m[INFO]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[32m[ OK ]\033[0m %s\n' "$*"; }
@@ -22,7 +29,7 @@ if [[ -n ${PY_ENV:-} ]]; then
     source "$PY_ENV/bin/activate"
     if [[ $_had_u == 1 ]]; then set -u; fi
   elif [[ ${_SKIP_VENV_CHECK:-0} != 1 ]]; then
-    warn "PY_ENV=$PY_ENV 不存在：裸机先运行 ./install_env.sh；用容器请把 PY_ENV 留空"
+    warn "PY_ENV=$PY_ENV 不存在：裸机先运行 ./install_env.sh，或用 deploy.sh --py-env 指定已有环境；用容器请把 PY_ENV 留空"
   fi
 fi
 

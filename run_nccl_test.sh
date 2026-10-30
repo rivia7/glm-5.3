@@ -4,6 +4,7 @@
 #   节点0：./run_nccl_test.sh 0
 #   节点1：./run_nccl_test.sh 1
 # 结果表在节点0输出；两台的日志末尾都会分析 NCCL 是否走了 RDMA / GPUDirect。
+# 结果表里有 FAIL 项时，两台都以非 0 退出。
 # =====================================================================
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

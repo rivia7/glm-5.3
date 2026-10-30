@@ -4,6 +4,7 @@
   python3 smoke_test.py                  # 模型列表 / 原样输出（查乱码）/ 思考分离 / 工具调用
   python3 smoke_test.py --long 32000     # 另加约 32K token 的长上下文找暗号
   python3 smoke_test.py --bench 8        # 另加 8 并发吞吐粗测
+  python3 smoke_test.py --wait 3600      # 先等服务就绪再测（和启动脚本同时运行时用）
 
 默认从同目录 cluster.env 读取地址、端口、API Key 和模型名，可用参数覆盖。
 """
@@ -138,6 +139,22 @@ def t_bench(c, conc):
     return toks > 0, f"{conc} 并发共 {toks} tokens / {dt:.1f}s ≈ {toks / dt:.1f} tok/s（总吞吐，含 prefill）"
 
 
+def wait_ready(c, seconds):
+    """轮询 /v1/models，服务有响应就返回 True，超时返回 False。"""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        try:
+            c.req("GET", "/v1/models", timeout=10)
+            return True
+        except RuntimeError as e:  # HTTP 4xx（比如 API Key 不对）也说明服务已经起来了
+            if not str(e).startswith("HTTP 5"):
+                return True
+        except OSError:  # 连接被拒或超时：还在加载
+            pass
+        time.sleep(10)
+    return False
+
+
 def main():
     env = load_env(os.path.join(HERE, "cluster.env"))
     ap = argparse.ArgumentParser(description="GLM-5.3 服务冒烟测试")
@@ -147,9 +164,15 @@ def main():
     ap.add_argument("--long", type=int, default=0, metavar="TOKENS", help="长上下文测试的大致 token 数")
     ap.add_argument("--bench", type=int, default=0, metavar="N", help="并发吞吐测试的并发数")
     ap.add_argument("--timeout", type=float, default=600)
+    ap.add_argument("--wait", type=float, default=0, metavar="SECONDS", help="先等服务就绪，最多等这么多秒")
     a = ap.parse_args()
 
     c = Client(a.base.rstrip("/"), a.key, a.model, a.timeout)
+    if a.wait:
+        print(f"等待 {a.base} 就绪（最多 {a.wait:.0f}s）", flush=True)
+        if not wait_ready(c, a.wait):
+            print(f"[FAIL] {a.wait:.0f}s 内服务没有就绪", flush=True)
+            sys.exit(1)
     tests = [("模型列表", t_models), ("原样输出 / 思考分离", t_echo), ("工具调用", t_tool)]
     if a.long:
         tests.append((f"长上下文（约 {a.long} token）", lambda cl: t_long(cl, a.long)))

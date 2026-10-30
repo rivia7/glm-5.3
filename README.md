@@ -9,6 +9,7 @@
 | 文件 | 作用 |
 |---|---|
 | `cluster.env` | 唯一需要修改的配置文件，两台机器要保持一致 |
+| `deploy.sh` | 一键部署（裸机或容器）：依次做宿主机检查、环境准备、自检、跨机测试、启动，节点0 就绪后自动跑冒烟测试 |
 | `preflight.sh` | 上线前自检：GPU、RDMA 端口、RoCE GID、GPU 与网卡的 PCIe 距离、memlock、SGLang 参数支持情况、权重完整性、KV 容量估算 |
 | `run_nccl_test.sh` + `nccl_xnode_test.py` | 按 PP2×TP8 的实际通信方式测跨机带宽和时延，并检查 NCCL 是否走了 RDMA、是否用上了 GPUDirect |
 | `launch_glm53_pp2.sh` | 启动脚本，分 `bringup` 和 `serve` 两种模式 |
@@ -16,7 +17,6 @@
 | `install_env.sh` | 裸机：用 uv 建 Python 虚拟环境，并生成 `requirements.lock` 让两台完全一致 |
 | `host_setup.sh` | 裸机：宿主机准备。默认只检查，`--apply` 才修改 |
 | `rdma_perftest.sh` | 裸机：不经过 NCCL 的纯 RDMA 带宽测试，先排除网卡和交换机的问题 |
-| `glm53@.service` | 裸机：systemd 单元，开机自启、挂掉自动重启 |
 
 ## 部署结构
 
@@ -26,6 +26,34 @@
   GPU0-7：TP8，第 0-38 层 + embedding              GPU0-7：TP8，第 39-77 层 + lm_head
   HTTP :30000（对外提供服务）                       不对外提供服务
 ```
+
+## 一键部署
+
+`deploy.sh` 把下面「步骤」里的流程串起来：宿主机检查 → Python 环境 → 自检 → 跨机测试 → 启动 → 节点0 冒烟测试，任何一步失败就停下。两台用相同的选项各运行一次：
+
+```bash
+# 裸机，用已有的 SGLang 环境（也可以写进 cluster.env 的 PY_ENV）
+./deploy.sh 0 bringup --py-env /home/test/sglang_env/bin/activate    # 节点0
+./deploy.sh 1 bringup --py-env /home/test/sglang_env/bin/activate    # 节点1
+
+# 容器：自动创建或复用容器 glm53（镜像取 cluster.env 的 CONTAINER_IMAGE），后续步骤在容器里执行
+./deploy.sh 0 bringup --container    # 节点0
+./deploy.sh 1 bringup --container    # 节点1
+```
+
+第一次用 `bringup`，跑通后去掉它（默认是 `serve`）再运行一次。服务在前台运行，Ctrl-C 停止；要在断开 ssh 后继续运行，请放在 tmux 或 screen 里。其它选项：
+
+| 选项 | 作用 |
+|---|---|
+| `--host-apply` | 先执行 `host_setup.sh --apply`（非 root 时用 sudo） |
+| `--rdma-test` | 加跑纯 RDMA 带宽测试 |
+| `--skip-nccl-test` | 跳过跨机 NCCL 测试（测过一次之后可以加上） |
+| `--no-smoke` | 节点0不自动跑冒烟测试 |
+| `--dry-run` | 检查和测试照做，只打印启动命令，不启动 |
+
+`PY_ENV` 指向的环境不存在时，`deploy.sh` 会调用 `install_env.sh` 创建，然后停下：先在节点0运行，把生成的 `requirements.lock` 同步到节点1 再运行节点1，两台环境都就绪后再同时运行。
+
+BIOS 设置和系统软件（驱动、RDMA 库、CUDA Toolkit）仍要按 0b 手动准备。
 
 ## 步骤
 
@@ -37,7 +65,9 @@
 
 #### 0a. 用容器
 
-把 `cluster.env` 里的 `PY_ENV` 留空。宿主机上执行 `modprobe nvidia-peermem`，并在两台之间放通 TCP。
+用 `deploy.sh --container` 时，下面的 `docker run` 会自动执行，不用手动做。
+
+手动进容器运行脚本时，把 `cluster.env` 里的 `PY_ENV` 留空。宿主机上执行 `modprobe nvidia-peermem`，并在两台之间放通 TCP。
 
 ```bash
 docker run -d --name glm53 --gpus all --network host --ipc host --shm-size 32g \
@@ -86,6 +116,8 @@ RDMA 在容器里要正常工作，必须带上 `--device /dev/infiniband`、`--
    ```
 
    两台打印的「环境指纹」必须一致。其它脚本会自动激活 `PY_ENV` 指定的虚拟环境。
+
+   已有 SGLang 环境的话可以跳过这一步：把 `PY_ENV` 指向它（写目录或 `bin/activate` 都行，如 `/home/test/sglang_env/bin/activate`），或者运行 `deploy.sh` 时加 `--py-env`。
 5. **先测纯 RDMA**（可选，但推荐在 NCCL 测试之前做）：
 
    ```bash
@@ -95,7 +127,7 @@ RDMA 在容器里要正常工作，必须带上 `--device /dev/infiniband`、`--
 
    400G 网卡的 BW average 应达到 360 Gb/s 以上。如果 perftest 编译时带了 CUDA，可以在两条命令后面都加上离网卡最近的 GPU 序号，测 GPUDirect 的带宽。
 
-完成后照常进行步骤 1–6。正式服务建议交给 systemd 托管（见步骤 5）。
+完成后照常进行步骤 1–6。
 
 ### 1. 自检（两台都跑）
 
@@ -118,7 +150,7 @@ RDMA 在容器里要正常工作，必须带上 `--device /dev/infiniband`、`--
 - **日志分析**：应该出现 `NET/IB : Using`，并且有 GDRDMA 通道。
 - **PP 边界传输估算**：脚本会按实测带宽算出 prefill 每块、decode 每步的传输耗时。
 
-测试通过后再进行下一步。
+测试通过后再进行下一步。结果表里有 FAIL 项时，两台的脚本都会以非 0 退出。
 
 ### 3. 首次启动（bringup 模式）
 
@@ -153,25 +185,7 @@ python3 smoke_test.py --long 20000
 
 两台机器都改用 `serve` 模式重新启动，参数取自 `cluster.env`。启动后再跑一次 `smoke_test.py --long 60000 --bench 8`。
 
-裸机部署建议用 systemd 托管，这样能开机自启，挂掉也会自动重启。具体步骤：
-
-1. 把脚本目录放到 `/opt/glm53-pp2`（如果放在别处，就改 `glm53@.service` 里的两处路径）。
-2. 两台都执行：
-
-   ```bash
-   sudo cp glm53@.service /etc/systemd/system/ && sudo systemctl daemon-reload
-   ```
-
-3. 启动服务，节点0和节点1分别执行：
-
-   ```bash
-   sudo systemctl enable --now glm53@0    # 节点0
-   sudo systemctl enable --now glm53@1    # 节点1
-   ```
-
-4. 查看日志：`journalctl -u glm53@0 -f`。
-
-两台机器是一个整体，任一台退出，另一台也会因为通信中断而退出，然后各自重启并重新会合。如果某一台没有退出、一直卡着，就两台一起 `systemctl restart`。
+服务在前台运行，要在断开 ssh 后继续运行，请放在 tmux 或 screen 里。两台机器是一个整体：任一台退出，另一台也会因为通信中断而退出。如果某一台没有退出、一直卡着，就两台都停掉，再一起重新启动。
 
 ### 6. 调优（每次只改一项，改完重跑冒烟测试）
 
@@ -227,7 +241,8 @@ DeepGEMM 依赖 SM100 才有的 TMEM/tcgen05 指令，SM120 没有这些指令�
 | 报 tilelang 或 shared memory 相关错误 | 走到了 DSA 后端 | 设置 `ATTN_MODE=dense`，或换 SM120 镜像 |
 | `pcie_allreduce.cu` 处崩溃 | 设置了 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments` | 启动脚本已经 unset 这个变量，检查是否有别的地方重新设置了 |
 | 工具调用出现在 content 里，而不是 tool_calls | 解析器不对 | 必须用 `--tool-call-parser glm47` |
-| 裸机：ssh 登录后 memlock 仍不是 unlimited | limits.d 只对新的登录会话生效 | 重新登录；或直接用 systemd 单元启动（`LimitMEMLOCK=infinity`） |
+| 裸机：ssh 登录后 memlock 仍不是 unlimited | limits.d 只对新的登录会话生效 | 重新登录。`deploy.sh` 也会尝试把当前会话调到 unlimited，但不能超过硬限制 |
+| `deploy.sh`：一台停在 FAIL，另一台卡在测试或启动 | 另一台在等它会合；或两台的选项不一致（比如只有一台加了 `--skip-nccl-test`） | 在卡住的那台 Ctrl-C，解决问题后两台用相同的选项一起重新运行 |
 | 裸机：两台的环境指纹不一致 | 两台分别从网上安装，版本漂移了 | 删掉第二台的 `PY_ENV`，用第一台生成的 `requirements.lock` 重新运行 `install_env.sh` |
 | 裸机：首次启动长时间卡在编译 / 报找不到 nvcc | flashinfer 在 SM120 上做 JIT 编译 | 装 CUDA Toolkit 并设置 `CUDA_HOME`；编译缓存在 `~/.cache/flashinfer`，第二次启动就快了 |
 | 裸机：perftest 带宽正常，NCCL 带宽很低 | 没用上 GPUDirect（ACS/IOMMU 拦截，或 peermem/DMA-BUF 不可用） | 运行 `sudo ./host_setup.sh` 查看 ACS 和 IOMMU 状态 |

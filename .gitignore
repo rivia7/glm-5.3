@@ -1,0 +1,4 @@
+# 运行时生成，不要提交：日志里有内网 IP，lock 文件按部署环境生成
+logs/
+requirements.lock
+__pycache__/

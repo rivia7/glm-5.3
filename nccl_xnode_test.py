@@ -9,6 +9,8 @@ rank 0-7 在节点0，rank 8-15 在节点1；rank i 与 rank i+8 是流水级边
   2. 跨机单对 send/recv（rank 0 -> rank 8）
   3. 跨机 8 对同时 send/recv（PP 边界的真实形态：8 对共用一块网卡）
   4. 跨机 1 MiB 往返时延（约等于 decode 一步的边界传输量）
+
+有 FAIL 项时，两台机器上的所有进程都以退出码 1 结束。
 """
 import json
 import os
@@ -95,8 +97,10 @@ def report(r):
         print(f"  {label}：约 {best:.2f} ms（8 个 TP rank 分摊）~ {worst:.2f} ms（每个 rank 各发一份）")
     print("  prefill 一块的计算本身是几百毫秒量级；decode 一步是几十毫秒量级。")
     print("=" * 72)
-    if any(g.startswith("FAIL") for g, _, _ in rows):
+    failed = any(g.startswith("FAIL") for g, _, _ in rows)
+    if failed:
         print("有 FAIL 项：先看本节点日志里 NCCL 是否走了 NET/IB、是否有 GDRDMA（run_nccl_test.sh 末尾会分析）")
+    return failed
 
 
 def main():
@@ -166,10 +170,14 @@ def main():
 
     allres = [None] * world
     dist.all_gather_object(allres, res)
-    if rank == 0:
-        report(allres)
+    # 结论广播给所有进程：有 FAIL 时两台的 torchrun 都返回非 0，deploy.sh 据此停下
+    verdict = [report(allres) if rank == 0 else None]
+    dist.broadcast_object_list(verdict, src=0)
+    if verdict[0] and rank == G:
+        print("跨机测试有 FAIL 项，结果表在节点0的输出里")
     dist.barrier()
     dist.destroy_process_group()
+    sys.exit(1 if verdict[0] else 0)
 
 
 if __name__ == "__main__":

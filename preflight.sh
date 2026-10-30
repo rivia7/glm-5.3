@@ -156,7 +156,7 @@ ml="$(ulimit -l)"
 if [[ $ml == unlimited ]]; then
   ok "memlock = unlimited"
 else
-  bad "memlock = $ml，RDMA 注册内存会失败（容器加 --ulimit memlock=-1；裸机运行 host_setup.sh 后重新登录，或用 systemd 单元启动）"
+  bad "memlock = $ml，RDMA 注册内存会失败（容器加 --ulimit memlock=-1；裸机运行 sudo ./host_setup.sh --apply 后重新登录）"
 fi
 if [[ ! -f /.dockerenv ]]; then
   info "裸机部署：宿主机调优（IOMMU、ACS、NUMA、调频、防火墙）请运行 ./host_setup.sh 查看"
@@ -221,8 +221,16 @@ if HELP="$(python3 -m sglang.launch_server --help 2>/dev/null)"; then
       ok "支持 $f"
     else
       case $f in
-        --pp-size | --nnodes | --dist-init-addr | --kv-cache-dtype) bad "不支持 $f，请升级 SGLang" ;;
-        *) meh "不支持 $f（启动脚本会跳过或换成替代参数）" ;;
+        # 启动脚本只对这两个参数做了降级处理，其余都是直接传入
+        --fp8-gemm-backend | --enable-pcie-oneshot-allreduce) meh "不支持 $f（启动脚本会跳过或换成替代参数）" ;;
+        --speculative-algorithm)
+          if [[ ${ENABLE_MTP:-0} == 1 ]]; then
+            bad "不支持 $f，ENABLE_MTP=1 时启动会失败"
+          else
+            meh "不支持 $f（只在 ENABLE_MTP=1 时需要）"
+          fi
+          ;;
+        *) bad "不支持 $f，请升级 SGLang" ;;
       esac
     fi
   done
