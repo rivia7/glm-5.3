@@ -1,0 +1,36 @@
+# =====================================================================
+# 裸机用 systemd 托管 GLM-5.3（serve 模式）。实例名就是节点编号：
+#   节点0：glm53@0     节点1：glm53@1
+#
+# 安装（两台都做，把脚本目录放在 /opt/glm53-pp2，或改下面两处路径）：
+#   sudo cp glm53@.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   节点0：sudo systemctl enable --now glm53@0
+#   节点1：sudo systemctl enable --now glm53@1
+# 看日志：journalctl -u glm53@0 -f （另有完整日志在 /opt/glm53-pp2/logs/）
+#
+# 注意：两台是一个整体。任一台挂掉，另一台也会因通信中断退出；
+# Restart=on-failure 会让两边各自重启并重新会合。手动重启时两台一起重启。
+# =====================================================================
+[Unit]
+Description=GLM-5.3 PP2xTP8 node %i
+After=network-online.target nvidia-persistenced.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/glm53-pp2
+ExecStart=/opt/glm53-pp2/launch_glm53_pp2.sh %i serve
+Restart=on-failure
+RestartSec=60
+# 加载约 750GB 权重 + 编译，启动很慢；停止时给足时间释放显存
+TimeoutStartSec=infinity
+TimeoutStopSec=120
+KillMode=control-group
+# RDMA 注册内存必需
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+LimitSTACK=67108864
+
+[Install]
+WantedBy=multi-user.target
