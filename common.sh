@@ -58,8 +58,14 @@ setup_nccl_env() {
   elif [[ -n ${IB_GID_INDEX:-} ]]; then
     export NCCL_IB_GID_INDEX="$IB_GID_INDEX"
   fi
-  # 机内没有 NVLink，走 PCIe P2P（与社区 GLM-5 on RTX PRO 6000 配方一致）
-  export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
+  if [[ ${GPU_P2P:-1} == 0 ]]; then
+    # 卡间 P2P 不可用（拷贝的数据不对或会卡住）：机内改走主机共享内存
+    export NCCL_P2P_DISABLE=1
+    unset NCCL_P2P_LEVEL
+  else
+    # 机内没有 NVLink，走 PCIe P2P（与社区 GLM-5 on RTX PRO 6000 配方一致）
+    export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
+  fi
   export NCCL_MIN_NCHANNELS="${NCCL_MIN_NCHANNELS:-8}"
   export NCCL_ALLOC_P2P_NET_LL_BUFFERS="${NCCL_ALLOC_P2P_NET_LL_BUFFERS:-1}"
   export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
@@ -75,6 +81,50 @@ peer_ip() {
   if [[ $me == "$NODE0_ADDR" ]]; then echo "$NODE1_ADDR"
   elif [[ $me == "$NODE1_ADDR" ]]; then echo "$NODE0_ADDR"
   fi
+}
+
+# 检查 PP 两级的层划分（PP_LAYER_PARTITION 留空时同 SGLang 默认：均分，多出的层给第二级）。
+# 输出一行：OK:说明、WARN:说明 或 FAIL:说明。
+# GLM-5.3 的 DSA indexer 只在 indexer_types 为 full 的层算 top-k，shared 层复用上一层的 top-k。
+# 第二级从 shared 层开始时，SGLang 要从第一级把 top-k 传过去；稠密注意力下第一级不算 top-k，第一个请求就会报错
+pp_split_check() {
+  MODEL_PATH="$MODEL_PATH" PP_LAYER_PARTITION="${PP_LAYER_PARTITION:-}" ATTN_MODE="${ATTN_MODE:-dense}" python3 - <<'PY'
+import json, os
+try:
+    with open(os.path.join(os.environ["MODEL_PATH"], "config.json")) as f:
+        cfg = json.load(f)
+except Exception as e:
+    print(f"FAIL:读不到 {os.environ['MODEL_PATH']}/config.json（{type(e).__name__}），没法检查层划分")
+    raise SystemExit
+tc = cfg.get("text_config", cfg)
+L = int(tc.get("num_hidden_layers") or 0)
+types = tc.get("indexer_types") or []
+shared = lambda i: i < len(types) and types[i] == "shared"
+# 离均分最近的两个合法起点，作为建议值
+near = sorted(sorted((i for i in range(1, L) if not shared(i)), key=lambda i: abs(i - L / 2))[:2])
+good = " 或 ".join(f"{i},{L - i}" for i in near)
+part = os.environ["PP_LAYER_PARTITION"].strip()
+src = f"PP_LAYER_PARTITION={part}" if part else "PP_LAYER_PARTITION 留空（按 SGLang 默认均分）"
+try:
+    stages = [int(x) for x in part.split(",")] if part else [L // 2, L - L // 2]
+except ValueError:
+    stages = []
+if len(stages) != 2 or min(stages) < 1 or sum(stages) != L:
+    print(f"FAIL:{src}：要写成两个正整数，加起来等于模型的 {L} 层，如 {good}")
+    raise SystemExit
+b = stages[0]
+desc = f"第一级 0–{b - 1} 层（{b} 层），第二级 {b}–{L - 1} 层（{L - b} 层）"
+if shared(b):
+    fix = f"改成 PP_LAYER_PARTITION={good}"
+    if os.environ["ATTN_MODE"] == "dense":
+        print(f"FAIL:{src}，{desc}。第 {b} 层的 DSA indexer 是 shared（复用上一层的 top-k），"
+              f"稠密注意力下第二级从这层开始，处理第一个请求时就会报错；第二级要从 full 层开始，{fix}")
+    else:
+        print(f"WARN:{src}，{desc}。第 {b} 层的 DSA indexer 是 shared，"
+              f"SGLang 要把 top-k 随 hidden states 一起跨机传（没有验证过）；{fix} 可以省掉")
+else:
+    print(f"OK:{src}，{desc}")
+PY
 }
 
 # Python 环境指纹：所有已安装包及版本的哈希。两台机器输出一致才算环境相同

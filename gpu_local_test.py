@@ -51,6 +51,7 @@ TOPO = {  # nvidia-smi topo -m 的连接类型，由近到远
     "SYS": "跨 NUMA 节点，经过 CPU 之间的互连（UPI / xGMI）",
 }
 ALL_CPUS = os.sched_getaffinity(0)
+P2P_OFF = os.environ.get("NCCL_P2P_DISABLE") == "1"  # cluster.env 的 GPU_P2P=0（setup_nccl_env 据此设置）
 STREAMS = []   # 每张卡一条测试流
 RESULTS = []   # 每条结论的级别，最后统计
 
@@ -361,7 +362,7 @@ def test_topology(gpus):
         say("WARN", "这些卡对不能 P2P，拷贝要经主机内存中转（NCCL 会改走主机共享内存，SGLang 的自定义 all-reduce 也要求 P2P）：",
             "、".join(no), "检查 BIOS 里的 ACS / IOMMU（sudo ./host_setup.sh 查看）；有些平台本来就不支持跨 CPU 的 P2P")
     else:
-        say("OK", "所有卡对都能 P2P")
+        say("OK", "驱动报告所有卡对都能 P2P（数据对不对看第 3 部分的校验）")
     return topo, can
 
 
@@ -398,9 +399,15 @@ def test_pairs(can, send, recv, S, R):
     if not all(map(all, can)):
         print("* 不能 P2P，经主机内存中转")
     print()
-    if broken:
-        say("FAIL", "这些方向拷贝后的数据不对，P2P 传输出错：" + "、".join(broken),
-            "检查 BIOS 里的 ACS / IOMMU（sudo ./host_setup.sh 查看）；修好之前 NCCL 可能卡住或算错")
+    which = f"全部 {len(broken)} 个方向" if len(broken) == n * (n - 1) else "、".join(broken)
+    if broken and P2P_OFF:
+        say("WARN", f"P2P 拷贝后的数据不对：{which}",
+            "已按 GPU_P2P=0 关掉 P2P：NCCL 机内走主机共享内存，SGLang 不用自定义 all-reduce，部署不受影响")
+    elif broken:
+        say("FAIL", f"P2P 拷贝后的数据不对：{which}",
+            "检查 BIOS 里的 ACS / IOMMU（sudo ./host_setup.sh 查看）；修不好就在 cluster.env 设 GPU_P2P=0 不用 P2P",
+            "带宽还超过了 PCIe 链路的上限时，多半是装了 P2P 补丁驱动的消费级卡（BAR1 小于显存时写不对），只能设 GPU_P2P=0",
+            "修好或关掉之前，NCCL 可能卡住或算错")
     else:
         say("OK", "所有方向拷贝后的数据都校验一致")
     return uni, bi, lat, broken
@@ -464,9 +471,13 @@ def allreduce_worker(rank, world, port, sizes, q):
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world,
                             timeout=datetime.timedelta(minutes=3))
-    out = []
+    out, bad = [], torch.zeros(1, dtype=torch.int32, device="cuda")
     for nbytes, iters in sizes:
-        x = torch.zeros(nbytes // 2, dtype=torch.bfloat16, device="cuda")
+        # 先校验结果：每张卡填 rank+1，和应为 1+2+…+world（BF16 能精确表示）
+        x = torch.full((nbytes // 2,), rank + 1, dtype=torch.bfloat16, device="cuda")
+        dist.all_reduce(x)
+        bad += int(not bool((x == world * (world + 1) // 2).all()))
+        x.zero_()
         for _ in range(5):
             dist.all_reduce(x)
         torch.cuda.synchronize()
@@ -481,8 +492,9 @@ def allreduce_worker(rank, world, port, sizes, q):
         t = torch.tensor([start.elapsed_time(stop) / 1e3 / iters], device="cuda")
         dist.all_reduce(t, op=dist.ReduceOp.MAX)
         out.append(t.item())
+    dist.all_reduce(bad)
     if rank == 0:
-        q.put(out)
+        q.put((out, bad.item()))
     dist.destroy_process_group()
 
 
@@ -501,12 +513,17 @@ def test_allreduce(n):
     q = mp.get_context("spawn").SimpleQueue()
     try:
         mp.spawn(allreduce_worker, args=(n, port, sizes, q), nprocs=n)
-        t_dec, t_pre = q.get()
+        (t_dec, t_pre), bad = q.get()
     except Exception as e:  # 子进程出错或被 NCCL 超时终止
         say("FAIL", "NCCL all-reduce 出错：", *str(e).strip().splitlines()[-20:],
             "单机 NCCL 也会初始化网卡：NCCL_SOCKET_IFNAME / NCCL_IB_HCA 指的网卡不可用时这里也会失败；"
             "网卡没问题就看第 2、3 部分的 P2P 结果")
         return
+    if bad:
+        say("FAIL", f"all-reduce 的结果不对（{bad} 张卡次）：NCCL 机内传输把数据写错了",
+            "P2P 拷贝的数据也不对时在 cluster.env 设 GPU_P2P=0；否则检查 BIOS 里的 ACS / IOMMU")
+    else:
+        say("OK", "all-reduce 的结果校验正确")
     print(f"[INFO] decode 一步（{batch} 个请求，{fmt_bytes(sizes[0][0])}）：{t_dec * 1e6:.0f} µs/次")
     bw = sizes[1][0] * 2 * (n - 1) / n / t_pre / 1e9
     g = grade(bw, 20, 8)
@@ -563,8 +580,8 @@ def main():
     summarize(topo, uni, bi, lat, h2d)
     del send, recv
     torch.cuda.empty_cache()
-    if broken:
-        print("\n[INFO] 卡间拷贝的数据不对，跳过 all-reduce（NCCL 大概率会卡住）")
+    if broken and not P2P_OFF:
+        print("\n[INFO] 卡间拷贝的数据不对，跳过 all-reduce（NCCL 走 P2P 大概率会卡住）；设 GPU_P2P=0 后再测")
     else:
         test_allreduce(n)
 

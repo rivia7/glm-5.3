@@ -25,6 +25,15 @@ DRY_RUN="${DRY_RUN:-0}"
 if [[ ! -f $MODEL_PATH/config.json && $DRY_RUN != 1 ]]; then
   die "找不到 $MODEL_PATH/config.json（两台机器要放在同一路径）"
 fi
+# 层划分不对时要等权重加载完、处理第一个请求才报错，所以启动前先查
+split="$(pp_split_check)"
+case $split in
+  OK:*) info "层划分：${split#OK:}" ;;
+  WARN:*) warn "层划分：${split#WARN:}" ;;
+  *)
+    if [[ $DRY_RUN == 1 ]]; then warn "层划分：${split#FAIL:}"; else die "层划分：${split#FAIL:}"; fi
+    ;;
+esac
 
 # ---------------- 网络 ----------------
 setup_nccl_env
@@ -50,7 +59,7 @@ if HELP="$(python3 -m sglang.launch_server --help 2>/dev/null)"; then
   :
 elif [[ $DRY_RUN == 1 ]]; then
   warn "当前环境没有 SGLang，DRY_RUN 下假设所有可选参数都支持"
-  HELP="--pp-size --fp8-gemm-backend --enable-pcie-oneshot-allreduce --model-loader-extra-config --enable-metrics --watchdog-timeout"
+  HELP="--pp-size --fp8-gemm-backend --enable-pcie-oneshot-allreduce --cuda-graph-max-bs-decode --attn-dp-size --model-loader-extra-config --enable-metrics --watchdog-timeout"
 else
   die "python3 -m sglang.launch_server --help 运行失败，检查 SGLang 环境"
 fi
@@ -67,14 +76,51 @@ else
   CTX="$CONTEXT_LENGTH"
   RUNNING="$MAX_RUNNING"
   MTP="${ENABLE_MTP:-0}"
-  GRAPH_ARGS=(--cuda-graph-max-bs "$CUDA_GRAPH_MAX_BS")
+  # 新版 SGLang 把 --cuda-graph-max-bs 拆成了按阶段的参数
+  if has_flag --cuda-graph-max-bs-decode; then
+    GRAPH_ARGS=(--cuda-graph-max-bs-decode "$CUDA_GRAPH_MAX_BS")
+  elif has_flag --cuda-graph-max-bs; then
+    GRAPH_ARGS=(--cuda-graph-max-bs "$CUDA_GRAPH_MAX_BS")
+  else
+    GRAPH_ARGS=()
+    warn "当前 SGLang 没有 --cuda-graph-max-bs(-decode)，CUDA_GRAPH_MAX_BS 不生效，用 SGLang 的默认值"
+  fi
 fi
 
-case "${ATTN_MODE:-dense}" in
+ATTN_MODE="${ATTN_MODE:-dsa}"
+KV_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
+ATTN_DP="${ATTN_DP_SIZE:-1}"
+case $ATTN_MODE in
   dense) ATTN_ARGS=(--attention-backend flashinfer) ;;  # 绕开 DSA，按稠密 MLA 计算
   dsa)   ATTN_ARGS=() ;;                                  # 交给 SGLang 自动选择 DSA 后端
   *)     die "ATTN_MODE 只能是 dense 或 dsa，收到: $ATTN_MODE" ;;
 esac
+case $KV_DTYPE in
+  fp8_e4m3 | bf16) ;;
+  *) die "KV_CACHE_DTYPE 只能是 fp8_e4m3 或 bf16，收到: $KV_DTYPE" ;;
+esac
+if [[ $ATTN_MODE == dense && $KV_DTYPE == fp8_e4m3 ]]; then
+  # SGLang 0.5.23 只给 DSA 准备了 SM120 的 FP8 KV kernel；稠密注意力配 FP8 KV 在 SM120 上会输出乱码
+  die "ATTN_MODE=dense 只能配 KV_CACHE_DTYPE=bf16；要用 FP8 KV 请设 ATTN_MODE=dsa"
+fi
+case $ATTN_DP in
+  1 | 2 | 4 | 8) ;;
+  *) die "ATTN_DP_SIZE 只能是 1、2、4、8（要能整除 TP8），收到: $ATTN_DP" ;;
+esac
+if ((ATTN_DP > 1)); then
+  # attention 分成 ATTN_DP 组，每组 8/ATTN_DP 张卡、各自处理不同的请求；MoE 仍按 TP8 切
+  if has_flag --attn-dp-size; then
+    ATTN_ARGS+=(--attn-dp-size "$ATTN_DP")
+  elif has_flag --enable-dp-attention; then
+    ATTN_ARGS+=(--dp-size "$ATTN_DP" --enable-dp-attention)
+    warn "当前 SGLang 没有 --attn-dp-size，改用旧写法 --dp-size $ATTN_DP --enable-dp-attention"
+  else
+    die "当前 SGLang 不支持 DP attention，把 ATTN_DP_SIZE 设成 1"
+  fi
+  if [[ $MTP == 1 ]]; then
+    die "ENABLE_MTP=1 不能和 ATTN_DP_SIZE>1 同时用（SGLang 的 PP 投机解码不支持 DP attention）"
+  fi
+fi
 
 ARGS=(
   --model-path "$MODEL_PATH"
@@ -86,9 +132,9 @@ ARGS=(
   --nnodes 2
   --node-rank "$NODE_RANK"
   --dist-init-addr "${NODE0_ADDR}:${DIST_PORT}"
-  # SM120：BF16 KV（FP8 KV 在 SM120 上会输出乱码）、MoE 走 Triton
+  # 注意力和 KV（见 cluster.env 的 ATTN_MODE / KV_CACHE_DTYPE / ATTN_DP_SIZE）；SM120 上 MoE 走 Triton
   "${ATTN_ARGS[@]}"
-  --kv-cache-dtype bf16
+  --kv-cache-dtype "$KV_DTYPE"
   --moe-runner-backend triton
   # 容量与调度
   --mem-fraction-static "$MEM_FRACTION"
@@ -109,7 +155,13 @@ if has_flag --fp8-gemm-backend; then
 else
   warn "当前 SGLang 没有 --fp8-gemm-backend；若加载 FP8 权重时报 kernel 不支持，需要升级或换 SM120 镜像"
 fi
-if has_flag --enable-pcie-oneshot-allreduce; then
+if [[ ${GPU_P2P:-1} == 0 ]]; then
+  # 自定义 all-reduce（2 卡一组时才用）、PCIe-IPC all-reduce、旧版的 PCIe oneshot all-reduce 都靠 P2P，
+  # SGLang 默认都不先验证 P2P 的数据对不对，P2P 坏了会悄悄算错
+  ARGS+=(--disable-custom-all-reduce)
+  export SGLANG_ENABLE_PCIE_IPC_ALLREDUCE=0
+  info "GPU_P2P=0：--disable-custom-all-reduce、关掉 PCIe-IPC all-reduce，机内 all-reduce 走 NCCL（主机共享内存）"
+elif has_flag --enable-pcie-oneshot-allreduce; then
   ARGS+=(--enable-pcie-oneshot-allreduce)
 else
   ARGS+=(--disable-custom-all-reduce)
@@ -142,7 +194,7 @@ fi
 mkdir -p "$HERE/logs"
 LOG="$HERE/logs/glm53_node${NODE_RANK}_${MODE}_$(date +%Y%m%d_%H%M%S).log"
 
-info "节点 $NODE_RANK / 模式 $MODE / 注意力 ${ATTN_MODE:-dense} / MTP $MTP"
+info "节点 ${NODE_RANK} / 模式 ${MODE} / 注意力 ${ATTN_MODE}（${ATTN_DP} 组）/ KV ${KV_DTYPE} / MTP ${MTP}"
 if [[ $NODE_RANK == 0 ]]; then
   info "本机负责第一级流水 + HTTP 服务：http://${NODE0_ADDR}:${HTTP_PORT}"
 else

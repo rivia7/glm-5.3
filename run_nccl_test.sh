@@ -45,8 +45,11 @@ if ((n_net > 0)); then
   if ((n_gdr > 0)); then
     ok "跨机通道 $n_net 条，其中 $n_gdr 条用了 GPUDirect RDMA"
   else
-    warn "跨机通道 $n_net 条，但都没用 GPUDirect RDMA（数据绕道主机内存）。检查 nvidia-peermem、PCIe ACS、IOMMU"
+    warn "跨机通道 $n_net 条，都没用 GPUDirect RDMA（数据经主机内存中转）。GPU 与网卡之间隔着 CPU（topo 里是 NODE/SYS）或 CUDA 报告 GPU 不支持 GDR（preflight 会显示）时，NCCL 本来就不用；否则检查 nvidia-peermem、PCIe ACS、IOMMU"
   fi
+fi
+if grep -q "Watchdog caught collective operation timeout" "$LOG"; then
+  fail "NCCL 通信超时：常见原因是机内 P2P 不通（./run_gpu_test.sh 检查，不通就在 cluster.env 设 GPU_P2P=0），或两台之间端口没放通"
 fi
 if grep -q "NCCL WARN" "$LOG"; then
   warn "日志里有 NCCL WARN（前 5 条）："

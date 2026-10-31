@@ -55,6 +55,64 @@ if [[ -n ${CUDA_VISIBLE_DEVICES:-} ]]; then
 fi
 
 # ---------------------------------------------------------------------
+section "卡间 P2P（GPU_P2P=${GPU_P2P:-1}）"
+if [[ ${GPU_P2P:-1} == 0 ]]; then
+  info "不用 P2P：NCCL 机内走主机共享内存，SGLang 关掉自定义 all-reduce"
+else
+  # 驱动说能 P2P、拷贝也不报错，数据却可能是错的（如 P2P 补丁驱动 + BAR1 小于显存的消费级卡）。
+  # NCCL 和 SGLang 都不会察觉，表现为通信卡住或输出乱码，所以这里实际拷一次比对
+  p2p_out="$(timeout 120 python3 - 2>&1 <<'PY'
+import os
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+try:
+    import torch
+except Exception as e:
+    print(f"SKIP:导入 torch 失败（{type(e).__name__}），没有检查")
+    raise SystemExit
+n = torch.cuda.device_count()
+if n < 2:
+    print("SKIP:GPU 少于 2 张，没有检查")
+    raise SystemExit
+bad, nop2p = [], []
+for s, d in dict.fromkeys([(0, 1), (0, n // 2), (n - 1, 0)]):  # 同一 CPU 下、跨 CPU、反方向
+    if not torch.cuda.can_device_access_peer(s, d):
+        nop2p.append(f"GPU{s}→GPU{d}")
+        continue
+    a = torch.randint(-2**31, 2**31 - 1, (16 << 20,), dtype=torch.int32, device=f"cuda:{s}")
+    b = torch.empty_like(a, device=f"cuda:{d}")
+    b.copy_(a)  # 能 P2P 时 torch 直接走 P2P
+    torch.cuda.synchronize(d)
+    if not torch.equal(a.cpu(), b.cpu()):
+        bad.append(f"GPU{s}→GPU{d}")
+if bad:
+    print("FAIL:" + "、".join(bad) + " 的 P2P 拷贝数据不对：在 cluster.env 设 GPU_P2P=0（./run_gpu_test.sh 可以看全部卡对）")
+elif nop2p:
+    print("WARN:" + "、".join(nop2p) + " 不能 P2P（NCCL 会自动改走主机内存）；检查 ACS / IOMMU，或设 GPU_P2P=0")
+else:
+    print("OK:抽查的卡对 P2P 拷贝数据正确")
+PY
+)"
+  p2p_rc=$?
+  case $p2p_out in
+    *$'\n'*) p2p_last="${p2p_out##*$'\n'}" ;;
+    *) p2p_last="$p2p_out" ;;
+  esac
+  case $p2p_last in
+    FAIL:*) bad "${p2p_last#FAIL:}" ;;
+    WARN:*) meh "${p2p_last#WARN:}" ;;
+    OK:*)   ok "${p2p_last#OK:}" ;;
+    SKIP:*) info "${p2p_last#SKIP:}" ;;
+    *)
+      if ((p2p_rc == 124)); then
+        bad "P2P 拷贝 120 秒没完成（P2P 卡死）：在 cluster.env 设 GPU_P2P=0"
+      else
+        meh "P2P 检查没有跑完：$(tail -3 <<<"$p2p_out" | tr '\n' ' ')"
+      fi
+      ;;
+  esac
+fi
+
+# ---------------------------------------------------------------------
 section "RDMA（${IB_HCA} 端口 ${IB_PORT:-1}）"
 P="$(ib_sys)"
 LL="$(rdma_link_layer)"
@@ -152,6 +210,14 @@ elif [[ ${OPEN_KM:-0} == 1 ]] && ((kmaj > 5 || (kmaj == 5 && kmin >= 12))); then
 else
   meh "未加载 nvidia-peermem（宿主机执行 modprobe nvidia-peermem，或运行 host_setup.sh）"
 fi
+# 116 = CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED；为 0 时 NCCL 不会用 GDR，peermem 加载了也一样
+gdr="$(python3 -c '
+import ctypes
+cu = ctypes.CDLL("libcuda.so.1"); cu.cuInit(0); v = ctypes.c_int()
+print(v.value if cu.cuDeviceGetAttribute(ctypes.byref(v), 116, 0) == 0 else "?")' 2>/dev/null || true)"
+if [[ $gdr == 0 ]]; then
+  info "CUDA 报告 GPU 不支持 GPUDirect RDMA（GeForce 卡就是这样）：NCCL 跨机数据经主机内存中转，带宽低一些，PP 够用"
+fi
 ml="$(ulimit -l)"
 if [[ $ml == unlimited ]]; then
   ok "memlock = unlimited"
@@ -216,13 +282,28 @@ else
 fi
 if HELP="$(python3 -m sglang.launch_server --help 2>/dev/null)"; then
   for f in --pp-size --nnodes --dist-init-addr --kv-cache-dtype --attention-backend \
-           --moe-runner-backend --fp8-gemm-backend --enable-pcie-oneshot-allreduce --speculative-algorithm; do
+           --moe-runner-backend --disable-cuda-graph --disable-custom-all-reduce \
+           --fp8-gemm-backend --enable-pcie-oneshot-allreduce --speculative-algorithm; do
     if flag_in "$f" "$HELP"; then
       ok "支持 $f"
     else
       case $f in
-        # 启动脚本只对这两个参数做了降级处理，其余都是直接传入
-        --fp8-gemm-backend | --enable-pcie-oneshot-allreduce) meh "不支持 $f（启动脚本会跳过或换成替代参数）" ;;
+        # 启动脚本对这几个参数做了降级处理，其余都是直接传入
+        --fp8-gemm-backend) meh "不支持 $f（启动脚本会跳过）" ;;
+        --enable-pcie-oneshot-allreduce)
+          if [[ ${GPU_P2P:-1} == 0 ]]; then
+            info "不支持 $f（GPU_P2P=0 时本来就不用）"
+          else
+            meh "不支持 $f（启动脚本会换成 --disable-custom-all-reduce）"
+          fi
+          ;;
+        --disable-custom-all-reduce)  # GPU_P2P=0 或没有 PCIe oneshot all-reduce 时才传
+          if [[ ${GPU_P2P:-1} == 0 ]] || ! flag_in --enable-pcie-oneshot-allreduce "$HELP"; then
+            bad "不支持 $f，请升级 SGLang"
+          else
+            info "不支持 $f（启动脚本用 --enable-pcie-oneshot-allreduce，用不到它）"
+          fi
+          ;;
         --speculative-algorithm)
           if [[ ${ENABLE_MTP:-0} == 1 ]]; then
             bad "不支持 $f，ENABLE_MTP=1 时启动会失败"
@@ -234,8 +315,57 @@ if HELP="$(python3 -m sglang.launch_server --help 2>/dev/null)"; then
       esac
     fi
   done
+  if flag_in --cuda-graph-max-bs-decode "$HELP"; then
+    ok "支持 --cuda-graph-max-bs-decode"
+  elif flag_in --cuda-graph-max-bs "$HELP"; then
+    ok "支持 --cuda-graph-max-bs"
+  else
+    meh "不支持 --cuda-graph-max-bs-decode / --cuda-graph-max-bs（serve 模式下 CUDA_GRAPH_MAX_BS 不生效）"
+  fi
+  if [[ ${ATTN_DP_SIZE:-1} =~ ^[248]$ ]]; then  # 启动脚本优先用 --attn-dp-size，没有时降级成旧写法
+    if flag_in --attn-dp-size "$HELP"; then
+      ok "支持 --attn-dp-size"
+    elif flag_in --enable-dp-attention "$HELP"; then
+      meh "不支持 --attn-dp-size（启动脚本会改用旧写法 --dp-size --enable-dp-attention）"
+    else
+      bad "不支持 DP attention（--attn-dp-size / --enable-dp-attention），把 ATTN_DP_SIZE 设成 1 或升级 SGLang"
+    fi
+  fi
 else
   bad "python3 -m sglang.launch_server --help 运行失败"
+fi
+
+# ---------------------------------------------------------------------
+section "serve 参数（cluster.env）"
+attn_mode="${ATTN_MODE:-dsa}" kv_dtype="${KV_CACHE_DTYPE:-fp8_e4m3}" attn_dp="${ATTN_DP_SIZE:-1}"
+max_run="${MAX_RUNNING:-}" graph_bs="${CUDA_GRAPH_MAX_BS:-}"
+[[ $max_run =~ ^[1-9][0-9]*$ ]] || { bad "MAX_RUNNING 要是正整数，现在是 ${max_run:-空}"; max_run=0; }
+case $attn_mode in
+  dsa | dense) ok "ATTN_MODE=$attn_mode" ;;
+  *) bad "ATTN_MODE 只能是 dsa 或 dense，现在是 $attn_mode" ;;
+esac
+case $kv_dtype in
+  fp8_e4m3 | bf16) ok "KV_CACHE_DTYPE=$kv_dtype" ;;
+  *) bad "KV_CACHE_DTYPE 只能是 fp8_e4m3 或 bf16，现在是 $kv_dtype" ;;
+esac
+if [[ $attn_mode == dense && $kv_dtype == fp8_e4m3 ]]; then
+  bad "ATTN_MODE=dense 只能配 KV_CACHE_DTYPE=bf16（SM120 上稠密注意力配 FP8 KV 会输出乱码）；要用 FP8 KV 请设 ATTN_MODE=dsa"
+fi
+case $attn_dp in
+  1) ok "ATTN_DP_SIZE=1：attention 按 TP8 切，所有请求共用一份 prefix cache" ;;
+  2 | 4 | 8)
+    ok "ATTN_DP_SIZE=${attn_dp}：attention 分 ${attn_dp} 组，每组最多 $((max_run / attn_dp)) 个请求，各有一份 prefix cache"
+    if ((max_run % attn_dp)); then
+      meh "MAX_RUNNING=${max_run} 不是 ${attn_dp} 的倍数，每组按 $((max_run / attn_dp)) 个算"
+    fi
+    if [[ ${ENABLE_MTP:-0} == 1 ]]; then
+      bad "ENABLE_MTP=1 不能和 ATTN_DP_SIZE>1 同时用（SGLang 的 PP 投机解码不支持 DP attention）"
+    fi
+    ;;
+  *) bad "ATTN_DP_SIZE 只能是 1、2、4、8（要能整除 TP8），现在是 ${attn_dp}" ;;
+esac
+if [[ $attn_dp =~ ^[1248]$ && $graph_bs =~ ^[0-9]+$ ]] && ((graph_bs < max_run / attn_dp)); then
+  meh "CUDA_GRAPH_MAX_BS=${graph_bs} 小于每组的请求上限 $((max_run / attn_dp))：batch 超过它时 decode 不走 CUDA Graph，会变慢"
 fi
 
 # ---------------------------------------------------------------------
@@ -251,7 +381,8 @@ if [[ -f $MODEL_PATH/config.json ]]; then
     esac
   done < <(
     MODEL_PATH="$MODEL_PATH" GPU_MEM_MIB="$GPU_MEM_MIB" MEM_FRACTION="$MEM_FRACTION" \
-    PP_LAYER_PARTITION="${PP_LAYER_PARTITION:-}" python3 - <<'PY'
+    PP_LAYER_PARTITION="${PP_LAYER_PARTITION:-}" KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}" \
+    ATTN_DP_SIZE="${ATTN_DP_SIZE:-1}" python3 - <<'PY'
 import glob, json, os
 mp = os.environ["MODEL_PATH"]
 cfg = json.load(open(os.path.join(mp, "config.json")))
@@ -282,25 +413,61 @@ print(f"权重总大小 {total / 2**30:.0f} GiB")
 
 if L and kv_dim and total:
     part = os.environ.get("PP_LAYER_PARTITION", "").strip()
-    stages = [int(x) for x in part.split(",")] if part else [L // 2, L - L // 2]
-    if sum(stages) != L:
-        print(f"FAIL:PP_LAYER_PARTITION={part} 加起来不等于 {L}")
+    try:  # 写错时下面的「层划分」会报 FAIL，这里按均分估算
+        stages = [int(x) for x in part.split(",")] if part else []
+    except ValueError:
+        stages = []
+    if len(stages) != 2 or sum(stages) != L:
+        stages = [L // 2, L - L // 2]
     mem_mib = float(os.environ.get("GPU_MEM_MIB") or 0) or 97887.0  # 96GB 卡的典型值
     frac = float(os.environ.get("MEM_FRACTION") or 0.85)
-    w_gpu = total / 16
-    budget = mem_mib * 2**20 * frac - w_gpu
-    kv_tok = kv_dim * 2 * max(stages)  # BF16，TP 下每卡都存完整的 latent
-    print(f"层划分 {stages[0]}/{stages[1]} · 每卡权重约 {w_gpu / 2**30:.0f} GiB · "
-          f"KV 预算约 {budget / 2**30:.0f} GiB · 每 token KV {kv_tok / 1024:.1f} KiB")
-    if budget <= 0:
+    fp8 = os.environ.get("KV_CACHE_DTYPE") == "fp8_e4m3"
+    dp = os.environ.get("ATTN_DP_SIZE", "1")
+    dp = int(dp) if dp in ("1", "2", "4", "8") else 1
+    kv_lora = int(tc.get("kv_lora_rank") or 0)
+    rope = int(tc.get("qk_rope_head_dim") or 0)
+    # 每层每 token：BF16 存 latent + rope；FP8 存 FP8 latent、每 128 维一个 FP32 scale、BF16 rope（SGLang DSA 的布局）
+    per_layer = kv_lora + kv_lora // 128 * 4 + rope * 2 if fp8 else kv_dim * 2
+    # DSA indexer 的 K cache 只在 full 层分配：FP8 K + 一个 FP32 scale
+    types = tc.get("indexer_types") or []
+    idx_bytes = int(tc.get("index_head_dim") or 0) + 4
+    bounds = [(0, stages[0]), (stages[0], L)]
+    per_tok = [(hi - lo) * per_layer + sum(t == "full" for t in types[lo:hi]) * idx_bytes
+               for lo, hi in bounds]
+    # attention 每组 8/dp 张卡：attention 权重（FP8）和词表（BF16）只在组内切分，每卡比 TP8 多放一些
+    nh = int(tc.get("num_attention_heads") or 0)
+    q_lora = int(tc.get("q_lora_rank") or 0)
+    nope = int(tc.get("qk_nope_head_dim") or 0)
+    vd = int(tc.get("v_head_dim") or 0)
+    attn_layer = (H * q_lora + q_lora * nh * (nope + rope) + H * (kv_lora + rope)
+                  + kv_lora * nh * (nope + vd) + nh * vd * H)
+    share = dp / 8 - 1 / 8  # 每卡多放的比例：组内 8/dp 张卡分，TP8 下是 8 张
+    extra = [(n * attn_layer + int(tc.get("vocab_size") or 0) * H * 2) * share for n in stages]
+    w_gpu = [total * n / L / 8 for n in stages]  # 每级按层数分到 8 张卡（MTP 层不加载，算多了一点）
+    budget = [mem_mib * 2**20 * frac - w - e for w, e in zip(w_gpu, extra)]
+    toks = min(b / t for b, t in zip(budget, per_tok))  # 两级的 token 数取小的那个
+    print(f"层划分 {stages[0]}/{stages[1]} · KV {'FP8' if fp8 else 'BF16'} · 每卡权重约 "
+          f"{max(w + e for w, e in zip(w_gpu, extra)) / 2**30:.0f} GiB · KV 预算约 {min(budget) / 2**30:.0f} GiB · "
+          f"每 token KV {max(per_tok) / 1024:.1f} KiB")
+    if min(budget) <= 0:
         print("FAIL:按当前 MEM_FRACTION 放不下权重")
-    else:
-        print(f"粗估 KV 池约 {budget / kv_tok / 1e4:.0f} 万 token（所有请求共享；"
+    elif dp == 1:
+        print(f"粗估 KV 池约 {toks / 1e4:.0f} 万 token（所有请求共享；"
               f"以启动日志的 max_total_num_tokens 为准，激活和 CUDA Graph 还会再占一些）")
+    else:
+        print(f"粗估 KV 池每组约 {toks / 1e4:.0f} 万 token × {dp} 组 = {toks * dp / 1e4:.0f} 万 token"
+              f"（单个请求只能用所在那组的；attention 权重每卡多占约 {max(extra) / 2**30:.1f} GiB；"
+              f"以启动日志为准）")
 if H:
     print(f"PP 边界每 token 约 {H * 2 * 2 / 1024:.0f} KiB（BF16 hidden + residual）")
 PY
   )
+  split="$(pp_split_check)"
+  case $split in
+    OK:*)   ok "层划分：${split#OK:}" ;;
+    WARN:*) meh "层划分：${split#WARN:}" ;;
+    *)      bad "层划分：${split#FAIL:}" ;;
+  esac
   if have df; then info "磁盘：$(df -h "$MODEL_PATH" | awk 'NR==2{print $1" 总 "$2"，可用 "$4}')"; fi
 else
   bad "找不到 $MODEL_PATH/config.json（两台机器要放在同一路径）"
