@@ -11,6 +11,7 @@
 | `cluster.env` | 唯一需要修改的配置文件，两台机器要保持一致 |
 | `deploy.sh` | 一键部署（裸机或容器）：依次做宿主机检查、环境准备、自检、跨机测试、启动，节点0 就绪后自动跑冒烟测试 |
 | `preflight.sh` | 上线前自检：GPU、RDMA 端口、RoCE GID、GPU 与网卡的 PCIe 距离、memlock、SGLang 参数支持情况、权重完整性、KV 容量估算 |
+| `run_gpu_test.sh` + `gpu_local_test.py` | 本机 8 卡测试报告：单卡带宽、卡与卡之间（按 PIX/PXB/PHB/NODE/SYS 分类）的带宽和时延、8 卡 NCCL all-reduce |
 | `run_nccl_test.sh` + `nccl_xnode_test.py` | 按 PP2×TP8 的实际通信方式测跨机带宽和时延，并检查 NCCL 是否走了 RDMA、是否用上了 GPUDirect |
 | `launch_glm53_pp2.sh` | 启动脚本，分 `bringup` 和 `serve` 两种模式 |
 | `smoke_test.py` | 服务冒烟测试：检查乱码、思考内容分离、工具调用、长上下文、并发吞吐 |
@@ -30,7 +31,11 @@
 
 ## 一键部署
 
-`deploy.sh` 把下面「步骤」里的流程串起来：宿主机检查 → Python 环境 → 自检 → 跨机测试 → 启动 → 节点0 冒烟测试，任何一步失败就停下。两台用相同的选项各运行一次：
+`deploy.sh` 把下面「步骤」里的流程串起来：配置检查 → 宿主机检查 → Python 环境 → 自检 → 跨机测试 → 启动 → 节点0 冒烟测试，任何一步失败就停下。
+
+配置检查会先打印 `cluster.env` 的必填项：两台的 IP、`MODEL_PATH`、`API_KEY`，裸机还有 `PY_ENV`。它会确认本机的 IP 和节点编号对得上；还会核对 `NET_IFNAME`、`IB_HCA`/`IB_PORT`、`IB_GID_INDEX`、`LINE_RATE_GBPS`、`CUDA_HOME` 和本机的实际情况是否一致，不一致时给出建议值。
+
+两台用相同的选项各运行一次：
 
 ```bash
 # 裸机，用已有的 SGLang 环境（也可以写进 cluster.env 的 PY_ENV）
@@ -47,6 +52,7 @@
 | 选项 | 作用 |
 |---|---|
 | `--host-apply` | 先执行 `host_setup.sh --apply`（非 root 时用 sudo） |
+| `--gpu-test` | 加跑本机 GPU 测试（见步骤 1） |
 | `--rdma-test` | 加跑纯 RDMA 带宽测试 |
 | `--skip-nccl-test` | 跳过跨机 NCCL 测试（测过一次之后可以加上） |
 | `--no-smoke` | 节点0不自动跑冒烟测试 |
@@ -91,8 +97,14 @@ RDMA 在容器里要正常工作，必须带上 `--device /dev/infiniband`、`--
    - **CUDA Toolkit**：版本与 torch 的 CUDA 主版本一致，用于 flashinfer 的 JIT 编译。装好后在 `cluster.env` 里设置 `CUDA_HOME`。
    - **uv**：`pip install uv`。
 2. **BIOS**（两台都要做）：
-   - 关闭 PCIe ACS。不关的话，GPU 之间、GPU 与网卡之间的 P2P 会被绕到 CPU。
-   - IOMMU 关闭，或在内核参数里加 `iommu=pt`。
+   - 关闭 PCIe ACS。不关的话，GPU 之间、GPU 与网卡之间的 P2P 会被绕到 CPU。用 `sudo lspci -vvv | grep ACSCtl` 查看：`ReqRedir`、`CmpltRedir`、`EgressCtrl` 有一项是 `+` 就是开着；只有 `SrcValid+` 不影响 P2P。
+   - IOMMU 关闭，或在内核参数里加 `iommu=pt`。IOMMU 开着时（包括 `iommu=pt`），Linux 启动时会自己给 PCIe 桥打开 ACS，BIOS 里关 ACS 不管用：要么在 BIOS 里关掉 IOMMU（Intel 叫 VT-d，AMD 叫 AMD-Vi），要么每次开机后、起服务前运行：
+
+     ```bash
+     for b in $(sudo lspci -vvv | awk '/^[0-9a-f]/ {dev = $1} /ACSCtl:.*(ReqRedir|CmpltRedir|EgressCtrl)[+]/ {print dev}'); do
+       sudo setpci -s "$b" ECAP_ACS+0x6.w=0000
+     done
+     ```
    - 开启 Above 4G Decoding 和 Resizable BAR。
 3. **宿主机调优**：先只检查，确认后再实际修改。
 
@@ -137,6 +149,22 @@ RDMA 在容器里要正常工作，必须带上 `--device /dev/infiniband`、`--
 ```
 
 所有 FAIL 项必须先解决。如果是 RoCE 网络，自检会列出所有 RoCE v2 GID，把标了「IPv4」的那个 index 填到 `IB_GID_INDEX`。
+
+然后测本机 8 卡。两台各跑一次，不需要同时运行，约 1 分钟；`deploy.sh` 加 `--gpu-test` 时也会跑。服务在跑时不要测。
+
+```bash
+./run_gpu_test.sh
+```
+
+报告同时写入 `logs/gpu_test_<时间>.log`，有 FAIL 项时以非 0 退出。报告分五部分：
+
+1. **单卡**：主机内存 ↔ GPU 的拷贝带宽（主机内存取自卡所在的 NUMA 节点）、显存拷贝带宽，以及 PCIe 链路有没有跑到应有的代数和宽度。PCIe 5.0 x16 一般能到 50 GB/s 以上。
+2. **连接类型**：`nvidia-smi topo -m` 里每对卡之间的连接（PIX/PXB/PHB/NODE/SYS），以及哪些卡对不能 P2P。
+3. **卡与卡之间**：每对卡的单向、双向带宽和 16 字节拷贝时延，与 CUDA 示例 `p2pBandwidthLatencyTest` 同口径；拷完会校验数据。
+4. **按连接类型汇总**：每类卡对的带宽和时延，并列出明显比同类慢的卡对。
+5. **8 卡 all-reduce**：用部署时的 NCCL 设置，按 decode 一步、prefill 一块的消息大小测，也就是 TP8 实际用的通信。总线带宽 20 GB/s 以上算正常。
+
+跨 CPU（SYS）的卡对明显比其它类型慢时，可以运行 `NCCL_P2P_LEVEL=NODE ./run_gpu_test.sh`，让这些卡对改走主机内存，再对比第 5 部分的结果。
 
 ### 2. 跨机通信测试
 
@@ -235,7 +263,7 @@ DeepGEMM 依赖 SM100 才有的 TMEM/tcgen05 指令，SM120 没有这些指令�
 |---|---|---|
 | NCCL 报 `Failed to initialize network`（脚本设置了 `NCCL_NET=IB`，不会悄悄退回 TCP） | 容器没挂载 `/dev/infiniband`、memlock 受限、`IB_HCA` 名称写错 | 按第 0 步补齐 docker 参数，用 `ibv_devices` 核对设备名 |
 | RoCE 下连接卡住或超时 | GID index 不对，或两端不在同一子网、交换机没配 PFC/ECN | 用 preflight 列出的 RoCE v2 GID；检查交换机配置 |
-| 合计带宽低于 15 GB/s，且没有 GDRDMA | nvidia-peermem 没加载、PCIe ACS 开着、IOMMU 拦截 | `modprobe nvidia-peermem`，BIOS 里关闭 ACS（或用 setpci 关），IOMMU 设为 passthrough |
+| 合计带宽低于 15 GB/s，且没有 GDRDMA | nvidia-peermem 没加载、PCIe ACS 开着、IOMMU 拦截 | `modprobe nvidia-peermem`；按 0b 第 2 步关闭 ACS、IOMMU 设为 passthrough |
 | 节点1 一直等待，或初始化超时 | 端口没放通，或 `NET_IFNAME` / `NODE0_ADDR` 写错 | 两台之间放通 TCP；在节点1上 `ping -I <网卡> <节点0 IP>` |
 | 输出乱码，或只生成一个 token | 用了 FP8 KV | 确认启动命令里是 `--kv-cache-dtype bf16` |
 | 报 DeepGEMM 相关的 import 错误或 NameError | 走到了 DeepGEMM 代码路径 | 确认环境变量没被覆盖，必要时换 SM120 镜像 |
@@ -243,6 +271,8 @@ DeepGEMM 依赖 SM100 才有的 TMEM/tcgen05 指令，SM120 没有这些指令�
 | `pcie_allreduce.cu` 处崩溃 | 设置了 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments` | 启动脚本已经 unset 这个变量，检查是否有别的地方重新设置了 |
 | 工具调用出现在 content 里，而不是 tool_calls | 解析器不对 | 必须用 `--tool-call-parser glm47` |
 | 裸机：ssh 登录后 memlock 仍不是 unlimited | limits.d 只对新的登录会话生效 | 重新登录。`deploy.sh` 也会尝试把当前会话调到 unlimited，但不能超过硬限制 |
+| 本机 GPU 测试：某张卡主机 ↔ GPU 带宽偏低 | PCIe 链路降速（插槽、转接线、BIOS 里的速率设置），或 IOMMU 不是 passthrough | 报告里「实测链路」低于「PCIe 应为」时查硬件和 BIOS；链路正常就运行 `sudo ./host_setup.sh` 看 IOMMU |
+| 本机 GPU 测试：卡对不能 P2P、带宽明显偏低，或数据校验出错 | PCIe ACS 开着、IOMMU 拦截，或平台不支持跨 CPU 的 P2P | 运行 `sudo ./host_setup.sh` 查看 ACS 和 IOMMU，按 0b 第 2 步改 BIOS |
 | `deploy.sh`：一台停在 FAIL，另一台卡在测试或启动 | 另一台在等它会合；或两台的选项不一致（比如只有一台加了 `--skip-nccl-test`） | 在卡住的那台 Ctrl-C，解决问题后两台用相同的选项一起重新运行 |
 | 裸机：两台的环境指纹不一致 | 两台分别从网上安装，版本漂移了 | 删掉第二台的 `PY_ENV`，用第一台生成的 `requirements.lock` 重新运行 `install_env.sh` |
 | 裸机：首次启动长时间卡在编译 / 报找不到 nvcc | flashinfer 在 SM120 上做 JIT 编译 | 装 CUDA Toolkit 并设置 `CUDA_HOME`；编译缓存在 `~/.cache/flashinfer`，第二次启动就快了 |

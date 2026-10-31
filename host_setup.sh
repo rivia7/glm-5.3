@@ -154,11 +154,14 @@ else
   ok "IOMMU 未开启"
 fi
 if [[ $EUID -eq 0 ]] && have lspci; then
-  nacs="$(lspci -vvv 2>/dev/null | grep -c 'ACSCtl:.*SrcValid+' || true)"
-  if ((nacs > 0)); then
-    warn "$nacs 个 PCIe 桥开启了 ACS，GPU 之间、GPU 与网卡之间的 P2P 会被绕到 CPU。请在 BIOS 里关闭 ACS（裸机部署推荐做法）"
+  # 只数会把 P2P 转到 CPU 的 ReqRedir / CmpltRedir / EgressCtrl；SrcValid 只校验请求来自哪个设备，开着不影响 P2P
+  nacs="$(lspci -vvv 2>/dev/null | grep -cE 'ACSCtl:.*(ReqRedir|CmpltRedir|EgressCtrl)[+]' || true)"
+  if ((nacs == 0)); then
+    ok "没有 PCIe 桥开启 ACS 重定向（ReqRedir / CmpltRedir / EgressCtrl），P2P 不会被绕到 CPU"
+  elif compgen -G "/sys/class/iommu/*" >/dev/null; then
+    warn "$nacs 个 PCIe 桥开启了 ACS 重定向，GPU 之间、GPU 与网卡之间的 P2P 会被绕到 CPU。IOMMU 开着时内核启动会自己打开 ACS，BIOS 里关 ACS 不管用：在 BIOS 里关掉 IOMMU，或每次开机后用 setpci 关（见 README 0b 第 2 步）"
   else
-    ok "没有 PCIe 桥开启 ACS"
+    warn "$nacs 个 PCIe 桥开启了 ACS 重定向，GPU 之间、GPU 与网卡之间的 P2P 会被绕到 CPU。请在 BIOS 里关闭 ACS"
   fi
 else
   skip "检查 ACS 需要 root 和 lspci，跳过"
