@@ -17,6 +17,7 @@
 | `install_env.sh` | 裸机：用 uv 建 Python 虚拟环境，并生成 `requirements.lock` 让两台完全一致 |
 | `host_setup.sh` | 裸机：宿主机准备。默认只检查，`--apply` 才修改 |
 | `rdma_perftest.sh` | 裸机：不经过 NCCL 的纯 RDMA 带宽测试，先排除网卡和交换机的问题 |
+| `frpc.tar` | frp 客户端镜像 `snowdreamtech/frpc:0.61`（`docker save` 导出），用 `docker load -i frpc.tar` 导入。镜像自带的 `frpc.toml` 只是上游示例，运行时挂载自己的配置；真实配置里有服务器地址和 token，不要提交 |
 
 ## 部署结构
 
