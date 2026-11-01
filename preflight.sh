@@ -404,6 +404,12 @@ case $router in
   dynamo)
     ok "ROUTER=dynamo：节点0 用 Dynamo 前端对外服务，同一会话固定到一个 attention 组"
     [[ $ttl =~ ^[1-9][0-9]*$ ]] || bad "SESSION_TTL 要是正整数（秒），现在是 $ttl"
+    weight="${ROUTER_PREFILL_WEIGHT:-8}"
+    if [[ ! $weight =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      bad "ROUTER_PREFILL_WEIGHT 要是非负数，现在是 $weight"
+    elif awk -v w="$weight" 'BEGIN { exit !(w < 2) }'; then
+      meh "ROUTER_PREFILL_WEIGHT=${weight}：不带会话头的长会话容易被负载差挤到别的组、整段重算（Claude Code 回放里取 1 时，58% 的后续轮次换了组）"
+    fi
     if [[ $attn_dp == 1 ]]; then
       meh "ATTN_DP_SIZE=1 只有一组，会话固定没有作用（只是多一层转发）；可以改用 ROUTER=sglang"
     fi
@@ -429,6 +435,10 @@ print(version("ai-dynamo"), sglang.__version__)' 2>/dev/null | tail -1)" && [[ -
         if [[ $dver != "${DYNAMO_VERSION:-$dver}" ]]; then
           meh "装的 Dynamo 是 $dver，cluster.env 写的是 DYNAMO_VERSION=$DYNAMO_VERSION（重新运行 ./install_dynamo.sh 换版本）"
         fi
+        fhelp="$("$dyn/bin/python" -m dynamo.frontend --help 2>/dev/null || true)"
+        for f in --router-mode --router-session-affinity-ttl-secs --router-prefill-load-scale --enable-anthropic-api; do
+          grep -qE -- "(^|[[:space:][])${f}([[:space:],]|\$)" <<<"$fhelp" || bad "Dynamo $dver 的前端不认 $f，启动脚本会起不来（--router-prefill-load-scale 在 1.7 移除，要改用 --router-policy-config）"
+        done
       else
         bad "$dyn/bin/python 里导入不了 dynamo.sglang / dynamo.frontend：重新运行 ./install_dynamo.sh 看报错"
       fi

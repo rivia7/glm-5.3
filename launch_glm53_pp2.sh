@@ -132,6 +132,8 @@ case $ROUTER in
 esac
 SESSION_TTL="${SESSION_TTL:-1800}"
 [[ $SESSION_TTL =~ ^[1-9][0-9]*$ ]] || die "SESSION_TTL 要是正整数（秒），收到: $SESSION_TTL"
+ROUTER_PREFILL_WEIGHT="${ROUTER_PREFILL_WEIGHT:-8}"
+[[ $ROUTER_PREFILL_WEIGHT =~ ^[0-9]+([.][0-9]+)?$ ]] || die "ROUTER_PREFILL_WEIGHT 要是非负数，收到: $ROUTER_PREFILL_WEIGHT"
 WORKER_SYSTEM_PORT=$((HTTP_PORT + 1))  # Dynamo worker 的 /health 和 /metrics（含 sglang: 开头的 SGLang 指标）
 WORKER_PORT=$((HTTP_PORT + 2))         # 只是传给节点0 SGLang 的 --port，Dynamo 模式下 SGLang 不起 HTTP 服务
 KV_EVENTS_PORT=$((HTTP_PORT + 100))    # 各 attention 组的 KV 事件端口从这里起（第 i 组 +i），只绑本机回环地址
@@ -250,6 +252,7 @@ if [[ $ROUTER == dynamo && $NODE_RANK == 0 ]]; then
     --http-port "$HTTP_PORT"
     --router-mode kv                                   # 新会话按各组的前缀缓存命中和负载选组
     --router-session-affinity-ttl-secs "$SESSION_TTL"  # 带会话头的请求固定在该会话第一次选中的组
+    --router-prefill-load-scale "$ROUTER_PREFILL_WEIGHT"  # 打分时要重算的块乘这个倍数（Dynamo 1.7 起改在 --router-policy-config 里设）
     --enable-anthropic-api                             # 和 SGLang 一样提供 /v1/messages
   )
   # GLM-5.3 的工具调用和思考内容由前端解析；清前缀缓存用 POST <节点0>:$WORKER_SYSTEM_PORT/engine/flush_cache
@@ -272,7 +275,7 @@ LOG="$HERE/logs/glm53_node${NODE_RANK}_${MODE}_${STAMP}.log"
 
 info "节点 ${NODE_RANK} / 模式 ${MODE} / 注意力 ${ATTN_MODE}（${ATTN_DP} 组）/ KV ${KV_DTYPE} / MTP ${MTP} / HiCache ${HICACHE} / 入口 ${ROUTER}"
 if ((USE_DYNAMO)); then
-  info "本机负责第一级流水 + Dynamo 前端：http://${NODE0_ADDR}:${HTTP_PORT}（会话空闲 ${SESSION_TTL}s 后解除固定）"
+  info "本机负责第一级流水 + Dynamo 前端：http://${NODE0_ADDR}:${HTTP_PORT}（会话空闲 ${SESSION_TTL}s 后解除固定，选组时重算权重 ${ROUTER_PREFILL_WEIGHT}）"
   info "SGLang 的 /metrics 在 http://${NODE0_ADDR}:${WORKER_SYSTEM_PORT}/metrics，前端自己的在 HTTP_PORT 上"
 elif [[ $NODE_RANK == 0 ]]; then
   info "本机负责第一级流水 + HTTP 服务：http://${NODE0_ADDR}:${HTTP_PORT}"

@@ -272,7 +272,7 @@ GSM8K 三者相差不到 1 个百分点，在 1319 题的误差范围内（约 �
 - **数据**：SemiAnalysis 公开的 Claude Code 抓包 trace `semianalysisai/cc-traces-weka-062126-256k`，393 个会话、6.8 万个请求，含子代理。trace 里只有每个请求的长度、前缀共享结构（hash_id）和时间。主会话的请求输入中位 13.5 万 token，其中新增的只有中位 1600 token，其余都能命中前缀缓存；输出中位 483 token；相邻两轮间隔中位 2 秒，长尾到几分钟。
 - **回放**：aiperf 0.13.0 的 AgentX 规则（`--scenario inferencex-agentx-mvp`）。按 hash_id 合成同样长度、同样共享结构的提示词，每棵会话树按录制的间隔一轮轮发；开始前先把每条会话预热到 trace 中随机的一点。每档回放 10 分钟（AgentX 要求 15 分钟，所以加了 `--unsafe-override`），`ignore_eos`，种子固定，同一并发下各配置回放的是同一批会话、同一组起点。
 - **配置**：都是 DSA + FP8 KV。TP8 用 `MAX_RUNNING=256`、`CUDA_GRAPH_MAX_BS=128`，8 组用默认的 512、64。会话的峰值上下文多数超过 128K（393 个里只有 83 个在 131072 以内），10-31 这几轮把 `CONTEXT_LENGTH` 临时调到 300000。
-- **Dynamo 入口（2026-11-01 加测）**：就是现在的默认配置（`ROUTER=dynamo`、`CONTEXT_LENGTH=262144`）。aiperf 设 `AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID=true`，给每个会话带上 `X-Dynamo-Session-ID`（子代理另带父会话的 ID）；另测一档不带会话头的，看只按前缀命中和负载选组时的效果。「测试代理」是 10-31 临时写的：按 aiperf 写在第一条 user 消息里的会话树标记固定分组，新会话分给活跃会话最少的组。
+- **Dynamo 入口（2026-11-01 加测）**：就是现在的默认配置（`ROUTER=dynamo`、`CONTEXT_LENGTH=262144`）。aiperf 设 `AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID=true`，给每个会话带上 `X-Dynamo-Session-ID`（子代理另带父会话的 ID）；另测了不带会话头的，看只按打分选组时的效果，分别用 Dynamo 自己默认的重算权重 1 和现在默认的 8（`ROUTER_PREFILL_WEIGHT`，见「为什么入口用 Dynamo」）。权重 8 那档是在同一套服务上另起一个只改了这个参数的前端测的。「测试代理」是 10-31 临时写的：按 aiperf 写在第一条 user 消息里的会话树标记固定分组，新会话分给活跃会话最少的组。
 
 「并发」是同时进行的会话树数，不是同时在跑的请求数：会话大部分时间在等工具或用户，16 棵树平均只有 2.5 个请求在跑。表里的输出 tok/s 是 10 分钟内的总输出，TTFT 取中位数，ITL 是平均值，命中率是输入 token 里不用重算的占比，显存命中和从主机内存拷回的都算（理论上限约 94%）。
 
@@ -283,13 +283,17 @@ GSM8K 三者相差不到 1 个百分点，在 1319 题的误差范围内（约 �
 | attention 8 组 + `ROUTER=sglang`（SGLang 轮询分组） | 12 · 13 s · 88 ms · 30% | 31 · 7.1 s · 157 ms · 48% | 31 · 4.0 s · 370 ms · 41% | — |
 | attention 8 组 + 测试代理按会话固定分组 | — | 62 · 0.6 s · 68 ms · 94% | 122 · 0.7 s · 91 ms · 94% | 184 · 1.1 s · 160 ms · 92% |
 | **attention 8 组 + Dynamo（默认），带会话头** | — | 64 · 0.6 s · 61 ms · 95% | 124 · 0.6 s · 86 ms · 95% | 204 · 1.0 s · 155 ms · 93% |
-| attention 8 组 + Dynamo，不带会话头 | — | — | — | 83 · 4.6 s · 490 ms · 69% |
+| attention 8 组 + Dynamo，不带会话头，`ROUTER_PREFILL_WEIGHT=8`（默认） | — | — | — | 176 · 1.2 s · 177 ms · 91% |
+| attention 8 组 + Dynamo，不带会话头，`ROUTER_PREFILL_WEIGHT=1`（Dynamo 自己的默认） | — | — | — | 83 · 4.6 s · 490 ms · 69% |
 
 - **SGLang 轮询分组最不适合 agent 负载**（`ROUTER=sglang`，10-31 之前的默认）：同一会话的下一轮多半落到别的组，要把十几万 token 的历史重算一遍。16 并发时输出只有 TP8 的四分之一，ITL 也被别组的重算拖到 157 ms。
 - **TP8 撑到约 16 个会话**：首 token 0.4 秒，单路 28–40 tok/s。32 个会话的上下文合计超过 123 万 token 的 KV 池，命中率掉到 34%，吞吐反而下降。
 - **HiCache 把 TP8 的上限推到约 32 个会话**：显存放不下的前缀存到主机内存，回访时拷回。代价是首 token 变慢（中位 5.2 s，约 7.7 万 token 拷回要 2 秒多），每台锁约 575 GB 内存。64 个会话时内存池也装不下，同样崩掉。
 - **按会话固定分组后，8 组撑到 64 个会话**：命中率回到理论值，KV 合计 761 万 token，吞吐随并发一路上升。Dynamo 和测试代理在 16、32 个会话时持平，64 个会话时多 11%（204 对 184 tok/s）。对照前端日志和 aiperf 的逐请求记录：同一会话相邻两轮一次也没有换过组。代价是单路慢（64 并发时约 7 tok/s）；各组忙闲不均：会话的活跃程度差别很大，16 个会话时一组承担了六成的输入，几轮累计下来输入最多的一组约占三成。
-- **一定要带会话头**：不带头时 Dynamo 只按前缀命中和负载选组。64 个会话里，同一会话相邻两轮有 58% 换了组，命中率掉到 69%，吞吐只有带头时的四成。原因是一个十万 token 的会话在 decode 时占约 1500 个 KV 块，两组之间差一两个长会话，负载差就超过重算整段前缀的代价，路由器就把会话挪走。Claude Code 自带 `x-claude-code-session-id`，不用改；其它客户端要在请求里加 `X-Session-ID`。
+- **最好带会话头，不带时靠重算权重**：不带头时 Dynamo 按「重算权重 × 要重算的 KV 块 + 在跑请求占的 KV 块」给各组打分。
+  - 权重取 Dynamo 自己默认的 1 时，64 个会话里同一会话相邻两轮有 58% 换了组，命中率掉到 69%，吞吐只有带头时的四成。一个十万 token 的会话在 decode 时占约 1500 个 KV 块，两组之间差一两个长会话，负载差就超过重算整段前缀的代价，路由器就把会话挪走。
+  - 权重 8（`ROUTER_PREFILL_WEIGHT` 的默认值）时换组降到 12%。32 次换组里有 25 次换去的组已经缓存了六成以上的前缀（子代理和父会话共用的部分），从头重算的只有 7 次，换组造成的重算从 304 万 token 降到 42 万。吞吐 176 tok/s，是权重 1 的 2.1 倍、带头时的 86%。带会话头时权重只影响新会话第一次选组：改成 8 后带头复测 64 个会话，202 tok/s、命中 92%、换组 0 次，和权重 1 时持平。
+  - Claude Code 自带 `x-claude-code-session-id`，不用改；其它客户端最好在请求里加 `X-Session-ID`。
 
 ### 6. 调优（每次只改一项，改完重跑冒烟测试）
 
@@ -351,7 +355,7 @@ GLM-5.3 的 attention 是 MLA：64 个头共用一份压缩 KV。按 TP8 切时�
 
 - **怎么选组**：
   - 请求带 `X-Session-ID`、`X-Dynamo-Session-ID` 头，或 Claude Code 自带的 `x-claude-code-session-id` 头时，同一会话固定在它第一次选中的组。这是硬约束：即使内容换成别的会话的前缀也不换组。会话空闲 `SESSION_TTL` 秒（默认 1800）后解除。
-  - 新会话和不带会话头的请求，按各组已经缓存的前缀和当前负载选组（`--router-mode kv`）。所以不带头的多轮对话，下一轮也会回到缓存所在的组。
+  - 新会话和不带会话头的请求按打分选组（`--router-mode kv`）：每组的分数是「`ROUTER_PREFILL_WEIGHT` × 要重算的 KV 块数（扣掉该组已经缓存的前缀）+ 该组在跑请求占的 KV 块数」，选分数最低的。Dynamo 自己的默认权重是 1，长会话的 decode 占用很容易盖过重算整段前缀的代价，会话被挪到别的组；这里默认 8，不带头的多轮对话多数也会回到缓存所在的组（回放数据见「正式服务」）。
 - **结构**：
   - 前端（`python -m dynamo.frontend`）负责 HTTP、chat template、分词，以及解析思考内容和工具调用（`--dyn-reasoning-parser glm45 --dyn-tool-call-parser glm47`）。它把 token 和选好的组发给节点0 的 Dynamo worker。
   - worker 进程里跑的就是 SGLang 引擎，请求按选好的组下发。节点1 不变，仍是原生 SGLang。
@@ -368,7 +372,7 @@ GLM-5.3 的 attention 是 MLA：64 个头共用一份压缩 KV。按 TP8 切时�
   - Dynamo 的事件平面还会在 0.0.0.0 上开十来个随机端口，传的是块哈希和负载，不含 token。
 - **限制**：
   - **不支持 `API_KEY`**：Dynamo 前端不做鉴权，`ROUTER=dynamo` 配 `API_KEY` 时启动脚本和 preflight 会拦下。要鉴权就在前面另加一层网关，或者用 `ROUTER=sglang`。
-  - **版本搭配没有官方背书**：ai-dynamo 1.6.1 声明配 SGLang 0.5.21。`install_dynamo.sh` 用 `--no-deps` 只装 Dynamo，跑在 `PY_ENV` 的 SGLang 0.5.23 上，冒烟测试和下面的回放都通过了。升级任何一边都要重测。
+  - **版本搭配没有官方背书**：ai-dynamo 1.6.1 声明配 SGLang 0.5.21。`install_dynamo.sh` 用 `--no-deps` 只装 Dynamo，跑在 `PY_ENV` 的 SGLang 0.5.23 上，冒烟测试和下面的回放都通过了。升级任何一边都要重测；`--router-prefill-load-scale` 在 Dynamo 1.7 会移除（改在 `--router-policy-config` 里设），preflight 会检查前端认不认启动脚本用到的参数。
   - **前端绑核**：多 NUMA 的机器上，前端会绑到网卡所在的 NUMA 节点。Dynamo 对跨 NUMA 运行会告警，说会严重变慢。
   - **前端退出即停服**：前端一退出，启动脚本会停掉整个服务，和一台退出另一台也退出一样。
 
@@ -416,7 +420,7 @@ DeepGEMM 依赖 SM100 才有的 TMEM/tcgen05 指令，SM120 没有这些指令�
 | 报 DeepGEMM 相关的 import 错误或 NameError | 走到了 DeepGEMM 代码路径 | 确认环境变量没被覆盖，必要时换 SM120 镜像 |
 | 报 tilelang 或 shared memory 相关错误 | DSA 选到了 SM120 跑不了的 kernel（SGLang 版本太旧，或 DSA 配了 BF16 KV） | 用 `KV_CACHE_DTYPE=fp8_e4m3`；还不行就 `ATTN_MODE=dense` + `KV_CACHE_DTYPE=bf16`，或换 SM120 镜像 |
 | 多轮对话的后续轮次首 token 很慢 | `ROUTER=sglang` 且 `ATTN_DP_SIZE>1`：每组各有一份 prefix cache，SGLang 不按会话分组，多半要重新 prefill；`ATTN_DP_SIZE=1` 时则是会话太多、KV 池装不下。看 `sglang:prefill_effective_tokens_total`：`device_hit` 加 `host_hit` 的占比明显低于平时就是这个原因（`input`、`device_hit`、`host_hit` 三项互不重叠，加起来是全部输入；`ROUTER=dynamo` 时这个指标在 `HTTP_PORT+1` 的 `/metrics`） | 分组时用默认的 `ROUTER=dynamo`；`ATTN_DP_SIZE=1` 会话不多时 `MAX_RUNNING` 降到 256 以内，会话多时加 `HICACHE_RATIO=2` |
-| `ROUTER=dynamo` 时，同一会话的后续轮次仍然要重算 | 客户端没带会话头，新一轮又被负载挤到了别的组；或会话空闲超过 `SESSION_TTL`，固定已经解除 | 请求带上 `X-Session-ID`（或 `X-Dynamo-Session-ID`）头，Claude Code 不用改；会话间隔长就调大 `SESSION_TTL` |
+| `ROUTER=dynamo` 时，同一会话的后续轮次仍然要重算 | 客户端没带会话头，新一轮又被负载挤到了别的组；或会话空闲超过 `SESSION_TTL`，固定已经解除 | 请求带上 `X-Session-ID`（或 `X-Dynamo-Session-ID`）头，Claude Code 不用改；没法带头时确认 `ROUTER_PREFILL_WEIGHT` 没有调小（默认 8）；会话间隔长就调大 `SESSION_TTL` |
 | `ROUTER=dynamo`：前端已经起来，`/v1/models` 却一直是空的 | 节点0 的 SGLang 还在加载，或者启动失败了（前端只列出已经注册的模型） | 看 `logs/glm53_node0_*.log`；加载完成、worker 注册之后模型就会出现 |
 | `ROUTER=dynamo`：服务自己停了，终端里有「Dynamo 前端退出了」 | 前端进程退出了，比如端口被占用 | 看提示里的前端日志 `logs/dynamo_frontend_*.log` |
 | `ROUTER=dynamo`：找不到 SGLang 的 `/metrics`、`/flush_cache` | 节点0 没有 SGLang 自己的 HTTP 服务 | 指标在 `http://<节点0>:<HTTP_PORT+1>/metrics`；清前缀缓存用 `POST http://<节点0>:<HTTP_PORT+1>/engine/flush_cache` |
