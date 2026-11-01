@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-# 一键部署：配置检查 → 宿主机检查 → Python 环境 → 自检 → 跨机测试 → 启动 →（节点0）冒烟测试
+# 一键部署：配置检查 → 宿主机检查 → Python 环境（ROUTER=dynamo 时节点0 另装 Dynamo）→ 自检 → 跨机测试 → 启动 →（节点0）冒烟测试
 # 任何一步失败就停下。两台用相同的选项各运行一次（先后无所谓，间隔不要太久）：
 #   节点0：./deploy.sh 0 [bringup|serve] [选项]
 #   节点1：./deploy.sh 1 [bringup|serve] [选项]
@@ -323,6 +323,17 @@ env_steps() {
     die "$(command -v python3) 里导入不了 sglang：用 --py-env 指定 SGLang 所在的环境，或在 cluster.env 里设置 PY_ENV"
   fi
   ok "Python $(command -v python3) · SGLang $ver"
+  if [[ ${ROUTER:-sglang} == dynamo && $NODE_RANK == 0 ]]; then
+    local dyn="${DYNAMO_PY_ENV:-}"
+    dyn="${dyn%/}"
+    dyn="${dyn%/bin/activate}"
+    if [[ -n $dyn && -x $dyn/bin/python ]]; then
+      ok "ROUTER=dynamo：Dynamo 环境 $dyn"
+    else
+      info "ROUTER=dynamo：${dyn:-DYNAMO_PY_ENV} 还没有 Dynamo，用 install_dynamo.sh 安装（只有节点0 需要）"
+      "$HERE/install_dynamo.sh"
+    fi
+  fi
 }
 
 test_steps() {

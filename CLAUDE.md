@@ -13,6 +13,7 @@ GLM-5.3 FP8 · 两台 8×RTX PRO 6000 · PP2×TP8（SGLang）部署脚本，各�
 - `launch_glm53_pp2.sh` 增删 SGLang 参数时，同步 `preflight.sh` 的参数检查：无条件传入的缺失算 FAIL，经 `has_flag` 降级的算 WARN。
 - 卡间 P2P：部署机上驱动报告能 P2P、数据却写不对，靠 `GPU_P2P=0` 绕开（NCCL 关 P2P，SGLang 关自定义 all-reduce 和 PCIe-IPC all-reduce）。根因、各修复路线和「动态 BAR1 P2P」驱动方案的评估与验证计划见 `docs/dynamic_bar1_p2p.md`；改 P2P 相关逻辑或动 GPU 驱动之前先读它。
 - 注意力三项（`ATTN_MODE`、`KV_CACHE_DTYPE`、`ATTN_DP_SIZE`）的组合限制在 `launch_glm53_pp2.sh`（die）和 `preflight.sh`（FAIL）各查一遍，改一处要同步另一处：SM120 上稠密注意力只能配 BF16 KV，`ATTN_DP_SIZE>1` 不能配 MTP。各配置的实测对比和取舍见 README「正式服务」「关键取舍」。
+- `ROUTER=dynamo`（默认）时节点0 的 SGLang 跑在 Dynamo worker 里（`dynamo_worker.py` 修正了 Dynamo 在 PP 下对 attention 组归属的判断），前端另起一个进程；节点1 仍是原生 `sglang.launch_server`。两台的 SGLang 参数保持一致，Dynamo 专用参数（`--dyn-*`、`--engine-route`）只加给节点0。Dynamo 只装在节点0 的叠加环境 `DYNAMO_PY_ENV`（`install_dynamo.sh`，`--no-deps`），不要装进 `PY_ENV`：它声明的依赖会降级 pydantic、装上 jax 等一大批包，带 `[sglang]` 还会换掉 SGLang。
 - 开着 `pipefail` 时，不要把退出码可能非 0 的命令直接接 `grep -q`（`ib_write_bw --help` 的退出码就是 1）：先存进变量再 grep。
 - 需要 root 的检查（`ufw status`、`lspci -vvv` 等）在非 root 时用 `host_setup.sh` 的 `skip` 标成没检查，不能当作通过。
 - 脚本要在两台 GPU 节点上运行（`smoke_test.py` 只用标准库，连得上服务就能跑），开发机上只做语法检查：

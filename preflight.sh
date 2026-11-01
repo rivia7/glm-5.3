@@ -331,6 +331,20 @@ if HELP="$(python3 -m sglang.launch_server --help 2>/dev/null)"; then
       bad "不支持 DP attention（--attn-dp-size / --enable-dp-attention），把 ATTN_DP_SIZE 设成 1 或升级 SGLang"
     fi
   fi
+  if [[ ${HICACHE_RATIO:-0} =~ ^[0-9]+([.][0-9]+)?$ && ! ${HICACHE_RATIO:-0} =~ ^0+([.]0+)?$ ]]; then
+    if flag_in --enable-hierarchical-cache "$HELP"; then
+      ok "支持 --enable-hierarchical-cache"
+    else
+      bad "不支持 --enable-hierarchical-cache，HICACHE_RATIO>0 时启动会失败"
+    fi
+  fi
+  if [[ ${ROUTER:-sglang} == dynamo ]]; then  # 两台都传，不支持就启动不了
+    if flag_in --kv-events-config "$HELP"; then
+      ok "支持 --kv-events-config"
+    else
+      bad "不支持 --kv-events-config，ROUTER=dynamo 时启动会失败（改成 ROUTER=sglang 或升级 SGLang）"
+    fi
+  fi
 else
   bad "python3 -m sglang.launch_server --help 运行失败"
 fi
@@ -367,6 +381,61 @@ esac
 if [[ $attn_dp =~ ^[1248]$ && $graph_bs =~ ^[0-9]+$ ]] && ((graph_bs < max_run / attn_dp)); then
   meh "CUDA_GRAPH_MAX_BS=${graph_bs} 小于每组的请求上限 $((max_run / attn_dp))：batch 超过它时 decode 不走 CUDA Graph，会变慢"
 fi
+hicache="${HICACHE_RATIO:-0}"
+if [[ ! $hicache =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  bad "HICACHE_RATIO 要是非负数（0 = 关），现在是 $hicache"
+elif [[ $hicache =~ ^0+([.]0+)?$ ]]; then
+  ok "HICACHE_RATIO=0：前缀缓存只在显存里"
+else
+  ok "HICACHE_RATIO=${hicache}：主机内存当二级前缀缓存，每卡锁页内存约为显存 KV 池的 ${hicache} 倍（下面「模型」一节估算整机用量）"
+fi
+
+# ---------------------------------------------------------------------
+section "入口（ROUTER=${ROUTER:-sglang}）"
+router="${ROUTER:-sglang}" ttl="${SESSION_TTL:-1800}"
+me="$(local_ip)"
+case $router in
+  sglang)
+    ok "ROUTER=sglang：SGLang 自带的 HTTP 服务，请求按轮询分到各 attention 组"
+    if [[ $attn_dp =~ ^[248]$ ]]; then
+      meh "ATTN_DP_SIZE=${attn_dp} 配 ROUTER=sglang：同一会话的请求会轮到不同的组，多轮对话、agent 的前缀缓存基本命中不了（短请求不受影响）"
+    fi
+    ;;
+  dynamo)
+    ok "ROUTER=dynamo：节点0 用 Dynamo 前端对外服务，同一会话固定到一个 attention 组"
+    [[ $ttl =~ ^[1-9][0-9]*$ ]] || bad "SESSION_TTL 要是正整数（秒），现在是 $ttl"
+    if [[ $attn_dp == 1 ]]; then
+      meh "ATTN_DP_SIZE=1 只有一组，会话固定没有作用（只是多一层转发）；可以改用 ROUTER=sglang"
+    fi
+    if [[ -n $me && $me != "$NODE0_ADDR" ]]; then
+      info "本机不是节点0：只跑原生 SGLang，不需要 Dynamo"
+    else
+      [[ -z ${API_KEY:-} ]] || bad "ROUTER=dynamo 不支持 API_KEY（Dynamo 前端不做鉴权）：要鉴权就在前面另加网关，或改用 ROUTER=sglang"
+      dyn="${DYNAMO_PY_ENV:-}"
+      dyn="${dyn%/}"
+      dyn="${dyn%/bin/activate}"
+      if [[ -z $dyn || ! -x $dyn/bin/python ]]; then
+        bad "找不到 Dynamo 环境 ${dyn:-（DYNAMO_PY_ENV 为空）}：在节点0 运行 ./install_dynamo.sh（deploy.sh 会自动装）"
+      elif out="$("$dyn/bin/python" -c 'import sglang, dynamo.frontend.main, dynamo.sglang.main
+from importlib.metadata import version
+print(version("ai-dynamo"), sglang.__version__)' 2>/dev/null | tail -1)" && [[ -n $out ]]; then
+        read -r dver sver <<<"$out"
+        pver="$(python3 -c 'import sglang; print(sglang.__version__)' 2>/dev/null || true)"
+        if [[ $sver != "$pver" ]]; then
+          bad "Dynamo 环境里的 SGLang 是 $sver，和 PY_ENV 的 ${pver:-（导入失败）} 不同：重新运行 ./install_dynamo.sh"
+        else
+          ok "Dynamo $dver（$dyn），SGLang 与 PY_ENV 同一份（$sver）"
+        fi
+        if [[ $dver != "${DYNAMO_VERSION:-$dver}" ]]; then
+          meh "装的 Dynamo 是 $dver，cluster.env 写的是 DYNAMO_VERSION=$DYNAMO_VERSION（重新运行 ./install_dynamo.sh 换版本）"
+        fi
+      else
+        bad "$dyn/bin/python 里导入不了 dynamo.sglang / dynamo.frontend：重新运行 ./install_dynamo.sh 看报错"
+      fi
+    fi
+    ;;
+  *) bad "ROUTER 只能是 dynamo 或 sglang，现在是 $router" ;;
+esac
 
 # ---------------------------------------------------------------------
 section "模型（$MODEL_PATH）"
@@ -382,7 +451,7 @@ if [[ -f $MODEL_PATH/config.json ]]; then
   done < <(
     MODEL_PATH="$MODEL_PATH" GPU_MEM_MIB="$GPU_MEM_MIB" MEM_FRACTION="$MEM_FRACTION" \
     PP_LAYER_PARTITION="${PP_LAYER_PARTITION:-}" KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}" \
-    ATTN_DP_SIZE="${ATTN_DP_SIZE:-1}" python3 - <<'PY'
+    ATTN_DP_SIZE="${ATTN_DP_SIZE:-1}" HICACHE_RATIO="${HICACHE_RATIO:-0}" python3 - <<'PY'
 import glob, json, os
 mp = os.environ["MODEL_PATH"]
 cfg = json.load(open(os.path.join(mp, "config.json")))
@@ -458,6 +527,35 @@ if L and kv_dim and total:
         print(f"粗估 KV 池每组约 {toks / 1e4:.0f} 万 token × {dp} 组 = {toks * dp / 1e4:.0f} 万 token"
               f"（单个请求只能用所在那组的；attention 权重每卡多占约 {max(extra) / 2**30:.1f} GiB；"
               f"以启动日志为准）")
+    try:
+        ratio = float(os.environ.get("HICACHE_RATIO") or 0)
+    except ValueError:  # 格式不对时上面「serve 参数」一节已经报 FAIL
+        ratio = 0.0
+    if ratio > 0 and min(budget) > 0:
+        need = ratio * min(budget) * 8  # 每张卡各一份；按 KV 预算估，实际以启动日志的 KV size 为准
+        avail = 0
+        try:
+            for line in open("/proc/meminfo"):
+                if line.startswith("MemAvailable:"):
+                    avail = int(line.split()[1]) * 1024
+        except OSError:
+            pass
+        msg = f"HiCache 每台约锁 {need / 2**30:.0f} GiB 内存（{ratio:g} × 每卡 KV 池约 {min(budget) / 2**30:.0f} GiB × 8 卡）"
+        if not avail:
+            print(f"WARN:{msg}；读不到 /proc/meminfo，没法核对可用内存")
+        elif need > avail - 10 * 2**30:
+            print(f"FAIL:{msg}，超过可用内存 {avail / 2**30:.0f} GiB（SGLang 还要留 10 GiB），调小 HICACHE_RATIO")
+        elif need > 0.8 * avail:
+            print(f"WARN:{msg}，占可用内存 {avail / 2**30:.0f} GiB 的 {need / avail * 100:.0f}%；"
+                  f"页缓存里的权重会被挤出去，重启时要重新读盘")
+        else:
+            print(f"OK:{msg}，可用内存 {avail / 2**30:.0f} GiB")
+        # 默认 write_through：显存里的前缀也会写一份到内存，所以总容量按内存池算
+        cap = toks * max(1.0, ratio)
+        if dp == 1:
+            print(f"粗估前缀缓存总容量约 {cap / 1e4:.0f} 万 token（8 张卡存同样的内容）")
+        else:
+            print(f"粗估前缀缓存总容量每组约 {cap / 1e4:.0f} 万 token × {dp} 组")
 if H:
     print(f"PP 边界每 token 约 {H * 2 * 2 / 1024:.0f} KiB（BF16 hidden + residual）")
 PY

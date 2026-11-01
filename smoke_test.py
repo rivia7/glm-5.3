@@ -140,12 +140,15 @@ def t_bench(c, conc):
 
 
 def wait_ready(c, seconds):
-    """轮询 /v1/models，服务有响应就返回 True，超时返回 False。"""
+    """轮询 /v1/models，返回了模型就返回 True，超时返回 False。
+
+    Dynamo 前端比 SGLang 先起来，模型加载完、worker 注册之前，模型列表是空的。
+    """
     deadline = time.time() + seconds
     while time.time() < deadline:
         try:
-            c.req("GET", "/v1/models", timeout=10)
-            return True
+            if c.req("GET", "/v1/models", timeout=10).get("data"):
+                return True
         except RuntimeError as e:  # HTTP 4xx（比如 API Key 不对）也说明服务已经起来了
             if not str(e).startswith("HTTP 5"):
                 return True

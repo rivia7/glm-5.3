@@ -10,12 +10,14 @@
 |---|---|
 | `cluster.env` | 唯一需要修改的配置文件，两台机器要保持一致 |
 | `deploy.sh` | 一键部署（裸机或容器）：依次做宿主机检查、环境准备、自检、跨机测试、启动，节点0 就绪后自动跑冒烟测试 |
-| `preflight.sh` | 上线前自检：GPU、RDMA 端口、RoCE GID、GPU 与网卡的 PCIe 距离、memlock、SGLang 参数支持情况、注意力配置组合、权重完整性、KV 容量估算 |
+| `preflight.sh` | 上线前自检：GPU、RDMA 端口、RoCE GID、GPU 与网卡的 PCIe 距离、memlock、SGLang 参数支持情况、注意力配置组合、权重完整性、KV 容量估算、HiCache 内存用量估算 |
 | `run_gpu_test.sh` + `gpu_local_test.py` | 本机 8 卡测试报告：单卡带宽、卡与卡之间（按 PIX/PXB/PHB/NODE/SYS 分类）的带宽和时延、8 卡 NCCL all-reduce |
 | `run_nccl_test.sh` + `nccl_xnode_test.py` | 按 PP2×TP8 的实际通信方式测跨机带宽和时延，并检查 NCCL 是否走了 RDMA、是否用上了 GPUDirect |
-| `launch_glm53_pp2.sh` | 启动脚本，分 `bringup` 和 `serve` 两种模式 |
+| `launch_glm53_pp2.sh` | 启动脚本，分 `bringup` 和 `serve` 两种模式；`ROUTER=dynamo` 时节点0 同时起 Dynamo 前端和 Dynamo worker |
+| `dynamo_worker.py` | 节点0 的 Dynamo SGLang worker 入口：修正 Dynamo 在 PP 下对 attention 组归属的判断（订阅全部 8 组的 KV 事件），KV 事件只走本机回环地址 |
 | `smoke_test.py` | 服务冒烟测试：检查乱码、思考内容分离、工具调用、长上下文、并发吞吐 |
 | `install_env.sh` | 裸机：用 uv 建 Python 虚拟环境，并生成 `requirements.lock` 让两台完全一致 |
+| `install_dynamo.sh` | 节点0：装 NVIDIA Dynamo（`ROUTER=dynamo` 时用，`deploy.sh` 发现没装会自动运行）。装在叠加于 `PY_ENV` 的虚拟环境里，共用其中的 SGLang，`PY_ENV` 不变 |
 | `host_setup.sh` | 裸机：宿主机准备。默认只检查，`--apply` 才修改 |
 | `rdma_perftest.sh` | 裸机：不经过 NCCL 的纯 RDMA 带宽测试，先排除网卡和交换机的问题 |
 | `frpc.tar` | frp 客户端镜像 `snowdreamtech/frpc:0.61`（`docker save` 导出），用 `docker load -i frpc.tar` 导入。镜像自带的 `frpc.toml` 只是上游示例，运行时挂载自己的配置；真实配置里有服务器地址和 token，不要提交 |
@@ -27,14 +29,15 @@
                 单路 400G RDMA（只传两级流水之间的 hidden states）
   节点0 ─────────────────────────────────────────────── 节点1
   GPU0-7：第 0-41 层 + embedding                   GPU0-7：第 42-77 层 + lm_head
-  HTTP :30000（对外提供服务）                       不对外提供服务
+  HTTP :30000 Dynamo 前端（对外提供服务）            原生 SGLang，不对外提供服务
+    └ 按会话把请求固定到 8 组之一 → SGLang（跑在 Dynamo worker 里）
 ```
 
-每台机器内部：MoE 按 TP8 切；attention 默认分 8 组（`ATTN_DP_SIZE=8`），每张卡一份完整的 attention，只处理分到自己这组的请求。注意力用 DSA 稀疏注意力，KV cache 用 FP8（原因见「关键取舍」）。
+每台机器内部：MoE 按 TP8 切；attention 默认分 8 组（`ATTN_DP_SIZE=8`），每张卡一份完整的 attention，只处理分到自己这组的请求。节点0 前面是 Dynamo 前端（`ROUTER=dynamo`），把同一会话的请求固定到同一组，长会话的前缀缓存才命中得了。注意力用 DSA 稀疏注意力，KV cache 用 FP8（原因见「关键取舍」）。
 
 ## 一键部署
 
-`deploy.sh` 把下面「步骤」里的流程串起来：配置检查 → 宿主机检查 → Python 环境 → 自检 → 跨机测试 → 启动 → 节点0 冒烟测试，任何一步失败就停下。
+`deploy.sh` 把下面「步骤」里的流程串起来：配置检查 → 宿主机检查 → Python 环境（`ROUTER=dynamo` 时节点0 还会用 `install_dynamo.sh` 装 Dynamo）→ 自检 → 跨机测试 → 启动 → 节点0 冒烟测试，任何一步失败就停下。
 
 配置检查会先打印 `cluster.env` 的必填项：两台的 IP、`MODEL_PATH`、`API_KEY`，裸机还有 `PY_ENV`。它会确认本机的 IP 和节点编号对得上；还会核对 `NET_IFNAME`、`IB_HCA`/`IB_PORT`、`IB_GID_INDEX`、`LINE_RATE_GBPS`、`CUDA_HOME` 和本机的实际情况是否一致，不一致时给出建议值。
 
@@ -157,7 +160,7 @@ RDMA 在容器里要正常工作，必须带上 `--device /dev/infiniband`、`--
 
 - **卡间 P2P**（`GPU_P2P=1` 时）：实际拷一次数据比对。驱动报告能 P2P、拷贝也不报错，数据却可能是错的，NCCL 和 SGLang 都察觉不到，表现为通信卡住或输出乱码。数据不对就设 `GPU_P2P=0`。
 - **层划分**：第二级必须从 DSA indexer 为 `full` 的层开始（原因见「关键取舍」），不满足时给出可选的 `PP_LAYER_PARTITION`。启动脚本启动前也会再查一次。
-- **注意力配置**：`ATTN_MODE`、`KV_CACHE_DTYPE`、`ATTN_DP_SIZE` 的组合（稠密注意力不能配 FP8 KV，attention 分组时不能开 MTP），并按这三项估算 KV 池容量。启动脚本也会拦下不支持的组合。
+- **注意力配置**：`ATTN_MODE`、`KV_CACHE_DTYPE`、`ATTN_DP_SIZE` 的组合（稠密注意力不能配 FP8 KV，attention 分组时不能开 MTP），并按这三项估算 KV 池容量。启动脚本也会拦下不支持的组合。`HICACHE_RATIO>0` 时还会估算每台要锁的主机内存，超过可用内存时报 FAIL。
 
 然后测本机 8 卡。两台各跑一次，不需要同时运行，约 1 分钟；`deploy.sh` 加 `--gpu-test` 时也会跑。服务在跑时不要测。
 
@@ -228,22 +231,30 @@ python3 smoke_test.py --long 20000
 
 服务在前台运行，要在断开 ssh 后继续运行，请放在 tmux 或 screen 里。两台机器是一个整体：任一台退出，另一台也会因为通信中断而退出。如果某一台没有退出、一直卡着，就两台都停掉，再一起重新启动。
 
-参考数据（2026-10-31，两台 8×96GB SM120，nvidia-smi 显示为 RTX 5090，`GPU_P2P=0`；跨机无 GPUDirect RDMA，网卡 PCIe 只有 Gen5 x8，裸 RDMA 约 30 GB/s；SGLang 0.5.23，serve 模式默认参数：DSA + FP8 KV + attention 8 组 + 512 并发）：
+参考数据（2026-10-31，两台 8×96GB SM120，nvidia-smi 显示为 RTX 5090，`GPU_P2P=0`；跨机无 GPUDirect RDMA，网卡 PCIe 只有 Gen5 x8，裸 RDMA 约 30 GB/s；SGLang 0.5.23，serve 模式参数：DSA + FP8 KV + attention 8 组 + 512 并发，入口是 SGLang 自带的 HTTP 服务（`ROUTER=sglang`）；2026-11-01 改成 Dynamo 入口后复测的项目在表里注明）：
 
 | 场景 | 结果 |
 |---|---|
-| 启动 | 第一次约 2.5 分钟就绪（权重从 NVMe 读，节点0 约 95 秒，每台只读自己那一级）；之后权重走页缓存，约 1.5 分钟就绪 |
+| 启动 | 第一次约 2.5 分钟就绪（权重从 NVMe 读，节点0 约 95 秒，每台只读自己那一级）；之后权重走页缓存，约 1.5 分钟就绪。`ROUTER=dynamo` 时前端几秒就起来，SGLang 加载完、worker 注册后才列出模型，约 2 分钟（`deploy.sh` 的配置检查和自检另需约 1 分钟） |
 | KV 池 | 每组 `max_total_num_tokens` 约 95 万，8 组合计约 761 万 |
 | 单路，1K 上下文 | 首 token 0.6 s，decode 约 25 tok/s |
 | 单路，30K 上下文 | 首 token 约 11 s，decode 约 25 tok/s |
-| 512 并发，每路输入 1K、输出 2K | 总输出约 3700 tok/s，单路约 8 tok/s |
-| 冒烟测试（`--long 60000 --bench 8`） | 5 项全部通过 |
+| 512 并发，每路输入 1K、输出 2K | 总输出约 3700 tok/s，单路约 8 tok/s。经 Dynamo（`--backend sglang-oai`）是 2800–2930 tok/s，原因见表下 |
+| 冒烟测试（`--long 60000 --bench 8`） | 5 项全部通过（`ROUTER=dynamo` 下同样通过） |
 
 两路以上并发时单路速度约减半：PP 把请求分成两个微批，两级交替处理。
 
-几种配置的对比如下。压测用 SGLang 自带的 `python -m sglang.benchmark.serving --dataset-name random-ids`（随机 token，请求持续到达，节点上没有外网时加 `HF_HUB_OFFLINE=1`），表里是总输出 tok/s。GSM8K 用 `python -m sglang.test.few_shot_gsm8k`，1319 题、5-shot。
+经 Dynamo 打 512 并发时，逐 token 速度和直连一样（TPOT 中位 121–123 ms），少的那两成多全在分组：
 
-| 场景 | 稠密 + BF16 KV，attention TP8，32 并发上限（旧默认） | DSA + FP8 KV，attention TP8 | DSA + FP8 KV，attention 8 组（默认） |
+- SGLang 轮询正好每组 64 个；Dynamo 按负载分，分成每组 63–65 个。
+- 每组最多同时跑 64 个（`MAX_RUNNING/ATTN_DP_SIZE`），多出来的几个要等前一整批跑完才开始。这次有 4 个请求的首 token 等了 100 秒以上，独自把总时长拉长了约 80 秒。
+- 这种合成负载所有请求一样长、同时开始、同时结束，才会把这个问题放大；真实负载里请求长短不一，空位很快就会腾出来。
+
+另外 random-ids 经 OpenAI 接口发送时是先解码成文本、再由前端重新分词的，每个请求的实际输入是 1066–1111 个 token，比直连多 4%–8%。
+
+几种配置的对比如下（都是 `ROUTER=sglang`）。压测用 SGLang 自带的 `python -m sglang.benchmark.serving --dataset-name random-ids`（随机 token，请求持续到达，节点上没有外网时加 `HF_HUB_OFFLINE=1`），表里是总输出 tok/s。GSM8K 用 `python -m sglang.test.few_shot_gsm8k`，1319 题、5-shot。
+
+| 场景 | 稠密 + BF16 KV，attention TP8，32 并发上限（旧默认） | DSA + FP8 KV，attention TP8 | DSA + FP8 KV，attention 8 组（默认的注意力配置） |
 |---|---|---|---|
 | KV 池 | 72 万 token | 123 万 | 每组 95 万 × 8 组 |
 | GSM8K | 92.9% | 92.6% | 92.0% |
@@ -256,12 +267,37 @@ python3 smoke_test.py --long 20000
 
 GSM8K 三者相差不到 1 个百分点，在 1319 题的误差范围内（约 ±0.7%）。
 
+上面的 random-ids 每个请求互不相关，测不出 prefix cache 的作用。agent 类负载另用 Claude Code 的真实会话回放测过一轮（2026-10-31）。
+
+- **数据**：SemiAnalysis 公开的 Claude Code 抓包 trace `semianalysisai/cc-traces-weka-062126-256k`，393 个会话、6.8 万个请求，含子代理。trace 里只有每个请求的长度、前缀共享结构（hash_id）和时间。主会话的请求输入中位 13.5 万 token，其中新增的只有中位 1600 token，其余都能命中前缀缓存；输出中位 483 token；相邻两轮间隔中位 2 秒，长尾到几分钟。
+- **回放**：aiperf 0.13.0 的 AgentX 规则（`--scenario inferencex-agentx-mvp`）。按 hash_id 合成同样长度、同样共享结构的提示词，每棵会话树按录制的间隔一轮轮发；开始前先把每条会话预热到 trace 中随机的一点。每档回放 10 分钟（AgentX 要求 15 分钟，所以加了 `--unsafe-override`），`ignore_eos`，种子固定，同一并发下各配置回放的是同一批会话、同一组起点。
+- **配置**：都是 DSA + FP8 KV。TP8 用 `MAX_RUNNING=256`、`CUDA_GRAPH_MAX_BS=128`，8 组用默认的 512、64。会话的峰值上下文多数超过 128K（393 个里只有 83 个在 131072 以内），10-31 这几轮把 `CONTEXT_LENGTH` 临时调到 300000。
+- **Dynamo 入口（2026-11-01 加测）**：就是现在的默认配置（`ROUTER=dynamo`、`CONTEXT_LENGTH=262144`）。aiperf 设 `AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID=true`，给每个会话带上 `X-Dynamo-Session-ID`（子代理另带父会话的 ID）；另测一档不带会话头的，看只按前缀命中和负载选组时的效果。「测试代理」是 10-31 临时写的：按 aiperf 写在第一条 user 消息里的会话树标记固定分组，新会话分给活跃会话最少的组。
+
+「并发」是同时进行的会话树数，不是同时在跑的请求数：会话大部分时间在等工具或用户，16 棵树平均只有 2.5 个请求在跑。表里的输出 tok/s 是 10 分钟内的总输出，TTFT 取中位数，ITL 是平均值，命中率是输入 token 里不用重算的占比，显存命中和从主机内存拷回的都算（理论上限约 94%）。
+
+| 配置 | 并发 8 | 并发 16 | 并发 32 | 并发 64 |
+|---|---|---|---|---|
+| attention TP8（`ATTN_DP_SIZE=1`） | 40 tok/s · TTFT 0.4 s · ITL 25 ms · 命中 92% | 120 · 0.4 s · 41 ms · 93% | 33 · 59 s · 178 ms · 34%（KV 池装不下，大量重算） | 没测（预计更差） |
+| TP8 + HiCache（`HICACHE_RATIO=2`） | — | — | 145 · 5.2 s · 63 ms · 91%（命中的约一半是从内存拷回的） | 51 · 257 s · 150 ms · 50%（内存池也装不下） |
+| attention 8 组 + `ROUTER=sglang`（SGLang 轮询分组） | 12 · 13 s · 88 ms · 30% | 31 · 7.1 s · 157 ms · 48% | 31 · 4.0 s · 370 ms · 41% | — |
+| attention 8 组 + 测试代理按会话固定分组 | — | 62 · 0.6 s · 68 ms · 94% | 122 · 0.7 s · 91 ms · 94% | 184 · 1.1 s · 160 ms · 92% |
+| **attention 8 组 + Dynamo（默认），带会话头** | — | 64 · 0.6 s · 61 ms · 95% | 124 · 0.6 s · 86 ms · 95% | 204 · 1.0 s · 155 ms · 93% |
+| attention 8 组 + Dynamo，不带会话头 | — | — | — | 83 · 4.6 s · 490 ms · 69% |
+
+- **SGLang 轮询分组最不适合 agent 负载**（`ROUTER=sglang`，10-31 之前的默认）：同一会话的下一轮多半落到别的组，要把十几万 token 的历史重算一遍。16 并发时输出只有 TP8 的四分之一，ITL 也被别组的重算拖到 157 ms。
+- **TP8 撑到约 16 个会话**：首 token 0.4 秒，单路 28–40 tok/s。32 个会话的上下文合计超过 123 万 token 的 KV 池，命中率掉到 34%，吞吐反而下降。
+- **HiCache 把 TP8 的上限推到约 32 个会话**：显存放不下的前缀存到主机内存，回访时拷回。代价是首 token 变慢（中位 5.2 s，约 7.7 万 token 拷回要 2 秒多），每台锁约 575 GB 内存。64 个会话时内存池也装不下，同样崩掉。
+- **按会话固定分组后，8 组撑到 64 个会话**：命中率回到理论值，KV 合计 761 万 token，吞吐随并发一路上升。Dynamo 和测试代理在 16、32 个会话时持平，64 个会话时多 11%（204 对 184 tok/s）。对照前端日志和 aiperf 的逐请求记录：同一会话相邻两轮一次也没有换过组。代价是单路慢（64 并发时约 7 tok/s）；各组忙闲不均：会话的活跃程度差别很大，16 个会话时一组承担了六成的输入，几轮累计下来输入最多的一组约占三成。
+- **一定要带会话头**：不带头时 Dynamo 只按前缀命中和负载选组。64 个会话里，同一会话相邻两轮有 58% 换了组，命中率掉到 69%，吞吐只有带头时的四成。原因是一个十万 token 的会话在 decode 时占约 1500 个 KV 块，两组之间差一两个长会话，负载差就超过重算整段前缀的代价，路由器就把会话挪走。Claude Code 自带 `x-claude-code-session-id`，不用改；其它客户端要在请求里加 `X-Session-ID`。
+
 ### 6. 调优（每次只改一项，改完重跑冒烟测试）
 
 | 想要 | 改什么 |
 |---|---|
 | 单路更快（交互式、并发不高） | `ATTN_DP_SIZE=1`、`MAX_RUNNING=256`、`CUDA_GRAPH_MAX_BS=256`；再快可以试 `ENABLE_MTP=1`（只能配 `ATTN_DP_SIZE=1`；PP 下没有验证过，报错或接受长度很低就关掉） |
-| 多轮对话、agent（每轮都带着很长的历史） | `ATTN_DP_SIZE=1`，所有请求共用一份 prefix cache（原因见「关键取舍」）；`MAX_RUNNING` 同时降到 256 以内 |
+| 多轮对话、agent（每轮都带着很长的历史） | 默认配置就是按这类负载定的：attention 8 组 + Dynamo 按会话固定分组，`CONTEXT_LENGTH=262144`（Claude Code 的会话常超过 128K）。会话不多（约 16 个以内）、更看重单路速度时，可以改成 `ATTN_DP_SIZE=1`、`MAX_RUNNING=256`、`CUDA_GRAPH_MAX_BS=128`，所有请求共用一份 prefix cache，单路 28–40 tok/s；到约 32 个会话再加 `HICACHE_RATIO=2`（每台锁约 575 GB 内存）。实测见「正式服务」的 Claude Code 回放，原因见「关键取舍」 |
+| 短请求、彼此没有共同前缀 | 入口用哪个都行，`ROUTER=sglang` 少一跳转发；要鉴权（`API_KEY`）就只能用它 |
 | 两级负载更均衡 | `PP_LAYER_PARTITION` 在 `42,36` 和 `38,40` 之间换（第二级只能从 full 层开始，preflight 会列出可选值；第一级含 3 层稠密层，计算较轻） |
 | 更多并发或更长上下文 | 调高 `MAX_RUNNING`（`CUDA_GRAPH_MAX_BS` 不小于 `MAX_RUNNING/ATTN_DP_SIZE`）/ `CONTEXT_LENGTH`；总量受 KV 池容量限制，attention 分组时单个请求只能用所在组的那份 |
 | 启动时 OOM | `MEM_FRACTION=0.80`，`CUDA_GRAPH_MAX_BS` 调小 |
@@ -304,10 +340,46 @@ GLM-5.3 的 attention 是 MLA：64 个头共用一份压缩 KV。按 TP8 切时�
 
 代价：
 
-- **prefix cache 按组分开**：每组各有一份。SGLang 按轮询或负载把请求分到各组，不看前缀，多轮对话的下一轮多半落到另一组，要重新 prefill。多轮对话、agent 这类每轮都带着长历史的场景，改用 `ATTN_DP_SIZE=1`。
+- **prefix cache 按组分开**：每组各有一份。SGLang 自己按轮询或负载把请求分到各组，不看前缀，多轮对话的下一轮多半落到另一组，要重新 prefill。Claude Code 回放里，前缀命中率从理论上的约 94% 掉到 30%–48%。所以默认在前面加 Dynamo，把同一会话固定到同一组（`ROUTER=dynamo`，见下一节），命中率回到理论值。用 `ROUTER=sglang` 时，多轮对话、agent 场景改用 `ATTN_DP_SIZE=1`。
 - **单个请求只能用所在组的 KV**：每组 95 万 token，远大于 `CONTEXT_LENGTH`，一般不受影响。
 - **不能开 MTP**：SGLang 在 PP 下的投机解码不支持 DP attention。
 - **chunked prefill 平分到各组**：每组每块 16384/8 = 2048 token。
+
+**为什么入口用 Dynamo（`ROUTER=dynamo`，默认）**
+
+节点0 的 HTTP_PORT 上跑 NVIDIA Dynamo 1.6.1 的前端，它决定每个请求进哪一组：
+
+- **怎么选组**：
+  - 请求带 `X-Session-ID`、`X-Dynamo-Session-ID` 头，或 Claude Code 自带的 `x-claude-code-session-id` 头时，同一会话固定在它第一次选中的组。这是硬约束：即使内容换成别的会话的前缀也不换组。会话空闲 `SESSION_TTL` 秒（默认 1800）后解除。
+  - 新会话和不带会话头的请求，按各组已经缓存的前缀和当前负载选组（`--router-mode kv`）。所以不带头的多轮对话，下一轮也会回到缓存所在的组。
+- **结构**：
+  - 前端（`python -m dynamo.frontend`）负责 HTTP、chat template、分词，以及解析思考内容和工具调用（`--dyn-reasoning-parser glm45 --dyn-tool-call-parser glm47`）。它把 token 和选好的组发给节点0 的 Dynamo worker。
+  - worker 进程里跑的就是 SGLang 引擎，请求按选好的组下发。节点1 不变，仍是原生 SGLang。
+  - 前端和 worker 用本地目录（`logs/dynamo_discovery`）做服务发现，请求和响应走本机回环地址，不需要 etcd 或 NATS。
+- **KV 事件**：
+  - SGLang 加了 `--kv-events-config`，第一级流水的 8 个调度进程把各组缓存了哪些块，发到本机 127.0.0.1 的 `HTTP_PORT+100` 起的 8 个端口。事件里带 token，所以只绑回环地址。
+  - Dynamo 1.6.1 默认认为多机时 attention 组按机器切分（8 组、2 台，每台 4 组）。PP2 下每台机器都有全部 8 组，不改的话节点0 只订阅 4 组。`dynamo_worker.py` 把这个判断改成按每级流水有几台机器来算，节点0 订阅全部 8 组。
+- **API**：
+  - OpenAI 的 `/v1/chat/completions`、`/v1/completions`。
+  - Anthropic 的 `/v1/messages`（`--enable-anthropic-api`，Dynamo 标为实验性）。thinking、tool_use、流式输出都测过。
+- **端口**：
+  - `HTTP_PORT`（30000）是前端。
+  - `HTTP_PORT+1`（30001）是 worker：`/metrics` 里有 SGLang 的 `sglang:` 指标，另有 `/health`，`POST /engine/flush_cache` 清前缀缓存。
+  - Dynamo 的事件平面还会在 0.0.0.0 上开十来个随机端口，传的是块哈希和负载，不含 token。
+- **限制**：
+  - **不支持 `API_KEY`**：Dynamo 前端不做鉴权，`ROUTER=dynamo` 配 `API_KEY` 时启动脚本和 preflight 会拦下。要鉴权就在前面另加一层网关，或者用 `ROUTER=sglang`。
+  - **版本搭配没有官方背书**：ai-dynamo 1.6.1 声明配 SGLang 0.5.21。`install_dynamo.sh` 用 `--no-deps` 只装 Dynamo，跑在 `PY_ENV` 的 SGLang 0.5.23 上，冒烟测试和下面的回放都通过了。升级任何一边都要重测。
+  - **前端绑核**：多 NUMA 的机器上，前端会绑到网卡所在的 NUMA 节点。Dynamo 对跨 NUMA 运行会告警，说会严重变慢。
+  - **前端退出即停服**：前端一退出，启动脚本会停掉整个服务，和一台退出另一台也退出一样。
+
+**主机内存二级前缀缓存（`HICACHE_RATIO`，默认关）**
+
+`HICACHE_RATIO>0` 时启动脚本加 `--enable-hierarchical-cache --hicache-ratio <倍数>`（SGLang 的 HiCache）。每张卡在主机内存里开一个「显存 KV 池 × 倍数」的锁页池。默认是 write_through：算出来的 KV 同时写一份到内存，显存里的被挤掉后，会话回访时从内存拷回，不用重算。SGLang 0.5.23 给 DSA 单独做了 indexer K 的主机池，换入换出会连它一起拷。
+
+- **容量**：TP8 下 8 张卡存的是同样的内容，内存也是 8 份。倍数 2 时每卡 246 万 token（67.9 GB）加 indexer 3.9 GB，每台约 575 GB；前缀缓存总容量约 247 万 token，是显存池的 2 倍。分组时每张卡存不同的会话，同样倍数下容量是 TP8 的约 6 倍（没测）。preflight 会按 `MemAvailable` 估算每台的用量，超出时报 FAIL。
+- **速度**：SGLang 的 JIT 拷贝 kernel 不支持 FP8 MLA 每 token 656 字节的布局（启动日志有 `Unsupported element_size = 656 for JIT HiCache kernel`），退回 sgl-kernel 的旧 kernel。实测约 7.7 万 token 从内存拷回要 2 秒多，比重算（约 10 秒）快得多，但比显存命中慢。
+- **正确性**：用 6 万 token 的检索题测过：先问一次，用 150 万 token 的别的文档把它挤出显存，再问。前缀全部从内存拷回，答案正确。
+- **代价**：锁页内存会把页缓存里的权重挤出去，下次重启要重新读盘。不适合内存紧张、或和别的服务共用内存的机器。
 
 **为什么第二级要从 DSA indexer 为 full 的层开始**
 
@@ -343,10 +415,14 @@ DeepGEMM 依赖 SM100 才有的 TMEM/tcgen05 指令，SM120 没有这些指令�
 | 输出乱码，或只生成一个 token | FP8 KV 没走 SM120 的 GLM 专用路径：日志里没有 `Set DSA backends for GLM FP8 KV Cache on SM120/SM121`（SGLang 版本太旧） | 升级 SGLang；或改成 `ATTN_MODE=dense` + `KV_CACHE_DTYPE=bf16` |
 | 报 DeepGEMM 相关的 import 错误或 NameError | 走到了 DeepGEMM 代码路径 | 确认环境变量没被覆盖，必要时换 SM120 镜像 |
 | 报 tilelang 或 shared memory 相关错误 | DSA 选到了 SM120 跑不了的 kernel（SGLang 版本太旧，或 DSA 配了 BF16 KV） | 用 `KV_CACHE_DTYPE=fp8_e4m3`；还不行就 `ATTN_MODE=dense` + `KV_CACHE_DTYPE=bf16`，或换 SM120 镜像 |
-| 多轮对话的后续轮次首 token 很慢 | `ATTN_DP_SIZE>1`：每组各有一份 prefix cache，请求不按前缀分组，多半要重新 prefill | 多轮对话、agent 场景设 `ATTN_DP_SIZE=1`，`MAX_RUNNING` 降到 256 以内 |
+| 多轮对话的后续轮次首 token 很慢 | `ROUTER=sglang` 且 `ATTN_DP_SIZE>1`：每组各有一份 prefix cache，SGLang 不按会话分组，多半要重新 prefill；`ATTN_DP_SIZE=1` 时则是会话太多、KV 池装不下。看 `sglang:prefill_effective_tokens_total`：`device_hit` 加 `host_hit` 的占比明显低于平时就是这个原因（`input`、`device_hit`、`host_hit` 三项互不重叠，加起来是全部输入；`ROUTER=dynamo` 时这个指标在 `HTTP_PORT+1` 的 `/metrics`） | 分组时用默认的 `ROUTER=dynamo`；`ATTN_DP_SIZE=1` 会话不多时 `MAX_RUNNING` 降到 256 以内，会话多时加 `HICACHE_RATIO=2` |
+| `ROUTER=dynamo` 时，同一会话的后续轮次仍然要重算 | 客户端没带会话头，新一轮又被负载挤到了别的组；或会话空闲超过 `SESSION_TTL`，固定已经解除 | 请求带上 `X-Session-ID`（或 `X-Dynamo-Session-ID`）头，Claude Code 不用改；会话间隔长就调大 `SESSION_TTL` |
+| `ROUTER=dynamo`：前端已经起来，`/v1/models` 却一直是空的 | 节点0 的 SGLang 还在加载，或者启动失败了（前端只列出已经注册的模型） | 看 `logs/glm53_node0_*.log`；加载完成、worker 注册之后模型就会出现 |
+| `ROUTER=dynamo`：服务自己停了，终端里有「Dynamo 前端退出了」 | 前端进程退出了，比如端口被占用 | 看提示里的前端日志 `logs/dynamo_frontend_*.log` |
+| `ROUTER=dynamo`：找不到 SGLang 的 `/metrics`、`/flush_cache` | 节点0 没有 SGLang 自己的 HTTP 服务 | 指标在 `http://<节点0>:<HTTP_PORT+1>/metrics`；清前缀缓存用 `POST http://<节点0>:<HTTP_PORT+1>/engine/flush_cache` |
 | 日志里频繁出现 retract，吞吐上不去 | KV 池满了，SGLang 把请求换出、之后重算 | 降低 `MAX_RUNNING`；`ATTN_DP_SIZE=1` 时可以改成 8（KV 池约为原来的 6 倍） |
 | `pcie_allreduce.cu` 处崩溃 | 设置了 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments` | 启动脚本已经 unset 这个变量，检查是否有别的地方重新设置了 |
-| 工具调用出现在 content 里，而不是 tool_calls | 解析器不对 | 必须用 `--tool-call-parser glm47` |
+| 工具调用出现在 content 里，而不是 tool_calls | 解析器不对 | `ROUTER=sglang` 要用 `--tool-call-parser glm47`，`ROUTER=dynamo` 要用前端的 `--dyn-tool-call-parser glm47`（启动脚本都已设置） |
 | 裸机：ssh 登录后 memlock 仍不是 unlimited | limits.d 只对新的登录会话生效 | 重新登录。`deploy.sh` 也会尝试把当前会话调到 unlimited，但不能超过硬限制 |
 | 本机 GPU 测试：某张卡主机 ↔ GPU 带宽偏低 | PCIe 链路降速（插槽、转接线、BIOS 里的速率设置），或 IOMMU 不是 passthrough | 报告里「实测链路」低于「PCIe 应为」时查硬件和 BIOS；链路正常就运行 `sudo ./host_setup.sh` 看 IOMMU |
 | 本机 GPU 测试：卡对不能 P2P、带宽明显偏低，或数据校验出错 | PCIe ACS 开着、IOMMU 拦截，或平台不支持跨 CPU 的 P2P | 运行 `sudo ./host_setup.sh` 查看 ACS 和 IOMMU，按 0b 第 2 步改 BIOS |

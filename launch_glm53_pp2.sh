@@ -10,7 +10,9 @@
 # bringup：第一次启动用。关 CUDA Graph、32K 上下文、8 并发、不开 MTP、
 #          NCCL 打 INFO 日志，先确认各个 kernel 和跨机通信都能跑通。
 # serve  ：正式服务，参数取自 cluster.env。
-# 只有节点0对外提供 HTTP（端口 HTTP_PORT）。
+# 只有节点0对外提供 HTTP（端口 HTTP_PORT）：ROUTER=dynamo 时是 Dynamo 前端（按会话固定 attention 组），
+# 节点0 的 SGLang 跑在 Dynamo worker（dynamo_worker.py）里；ROUTER=sglang 时是 SGLang 自带的 HTTP 服务。
+# 节点1 两种情况下都跑原生 SGLang。
 # =====================================================================
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -59,7 +61,7 @@ if HELP="$(python3 -m sglang.launch_server --help 2>/dev/null)"; then
   :
 elif [[ $DRY_RUN == 1 ]]; then
   warn "当前环境没有 SGLang，DRY_RUN 下假设所有可选参数都支持"
-  HELP="--pp-size --fp8-gemm-backend --enable-pcie-oneshot-allreduce --cuda-graph-max-bs-decode --attn-dp-size --model-loader-extra-config --enable-metrics --watchdog-timeout"
+  HELP="--pp-size --fp8-gemm-backend --enable-pcie-oneshot-allreduce --cuda-graph-max-bs-decode --attn-dp-size --model-loader-extra-config --enable-metrics --watchdog-timeout --enable-hierarchical-cache --kv-events-config"
 else
   die "python3 -m sglang.launch_server --help 运行失败，检查 SGLang 环境"
 fi
@@ -122,6 +124,33 @@ if ((ATTN_DP > 1)); then
   fi
 fi
 
+# 入口：ROUTER=dynamo 时节点0 用 Dynamo 前端对外服务，按会话把请求固定到同一个 attention 组
+ROUTER="${ROUTER:-sglang}"
+case $ROUTER in
+  dynamo | sglang) ;;
+  *) die "ROUTER 只能是 dynamo 或 sglang，收到: $ROUTER" ;;
+esac
+SESSION_TTL="${SESSION_TTL:-1800}"
+[[ $SESSION_TTL =~ ^[1-9][0-9]*$ ]] || die "SESSION_TTL 要是正整数（秒），收到: $SESSION_TTL"
+WORKER_SYSTEM_PORT=$((HTTP_PORT + 1))  # Dynamo worker 的 /health 和 /metrics（含 sglang: 开头的 SGLang 指标）
+WORKER_PORT=$((HTTP_PORT + 2))         # 只是传给节点0 SGLang 的 --port，Dynamo 模式下 SGLang 不起 HTTP 服务
+KV_EVENTS_PORT=$((HTTP_PORT + 100))    # 各 attention 组的 KV 事件端口从这里起（第 i 组 +i），只绑本机回环地址
+if [[ $ROUTER == dynamo ]]; then
+  has_flag --kv-events-config || die "当前 SGLang 不支持 --kv-events-config，ROUTER=dynamo 用不了，改成 ROUTER=sglang"
+  if [[ $NODE_RANK == 0 ]]; then
+    [[ -z ${API_KEY:-} ]] || die "ROUTER=dynamo 不支持 API_KEY（Dynamo 前端不做鉴权）：要鉴权就在前面另加网关，或改用 ROUTER=sglang"
+    DYN_PY="${DYNAMO_PY_ENV:-/opt/dynamo-venv}"
+    DYN_PY="${DYN_PY%/}"
+    DYN_PY="${DYN_PY%/bin/activate}/bin/python"
+    if [[ ! -x $DYN_PY && $DRY_RUN != 1 ]]; then
+      die "找不到 $DYN_PY：ROUTER=dynamo 要先在节点0 运行 ./install_dynamo.sh（或把 ROUTER 改成 sglang）"
+    fi
+    if ((ATTN_DP == 1)); then
+      warn "ATTN_DP_SIZE=1 只有一组，会话固定没有作用；只是多一层 Dynamo 转发"
+    fi
+  fi
+fi
+
 ARGS=(
   --model-path "$MODEL_PATH"
   --served-model-name "$SERVED_NAME"
@@ -142,12 +171,18 @@ ARGS=(
   --max-running-requests "$RUNNING"
   --chunked-prefill-size "$CHUNKED_PREFILL"
   "${GRAPH_ARGS[@]}"
-  # 解析器（显式写，兼容不认识 auto 的旧版本）
+  # 思考内容解析器（显式写，兼容不认识 auto 的旧版本）
   --reasoning-parser glm45
-  --tool-call-parser glm47
-  --host 0.0.0.0
-  --port "$HTTP_PORT"
 )
+if [[ $ROUTER == dynamo ]]; then
+  # 两台传同样的参数：只有第一级流水（节点0）的调度进程会发布，每组一个端口；
+  # Dynamo 靠这些事件知道哪一组缓存了哪些前缀。事件里带 token，所以只绑本机回环地址
+  ARGS+=(--kv-events-config "{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://127.0.0.1:${KV_EVENTS_PORT}\",\"bind\":true}"
+         --port "$WORKER_PORT")
+  # 工具调用由 Dynamo 前端解析（--dyn-tool-call-parser，见下面），SGLang 这边不能再设 --tool-call-parser
+else
+  ARGS+=(--tool-call-parser glm47 --host 0.0.0.0 --port "$HTTP_PORT")
+fi
 
 # ---------------- 可选参数（按版本支持情况添加）----------------
 if has_flag --fp8-gemm-backend; then
@@ -180,6 +215,18 @@ if [[ -n ${API_KEY:-} ]]; then
   ARGS+=(--api-key "$API_KEY")
 fi
 
+# ---------------- 主机内存二级前缀缓存（HiCache）----------------
+HICACHE="${HICACHE_RATIO:-0}"
+[[ $HICACHE =~ ^[0-9]+([.][0-9]+)?$ ]] || die "HICACHE_RATIO 要是非负数（0 = 关），收到: $HICACHE"
+[[ $MODE == bringup ]] && HICACHE=0
+if [[ ! $HICACHE =~ ^0+([.]0+)?$ ]]; then
+  # 显存放不下的前缀 KV 写到主机内存，会话回访时拷回、不用重算；每张卡各开「显存 KV 池 × HICACHE_RATIO」的锁页内存
+  has_flag --enable-hierarchical-cache || die "当前 SGLang 不支持 --enable-hierarchical-cache，把 HICACHE_RATIO 设成 0"
+  ARGS+=(--enable-hierarchical-cache --hicache-ratio "$HICACHE")
+else
+  HICACHE=0
+fi
+
 if [[ $MTP == 1 ]]; then
   # 必须：否则 NEXTN 会退化成 EAGLE，把整个模型再加载一遍，直接 OOM
   export SGLANG_ENABLE_SPEC_V2=True
@@ -190,42 +237,98 @@ if [[ $MTP == 1 ]]; then
   warn "MTP 在 PP 下没有公开验证；启动报错或日志里 accept length 很低就关掉"
 fi
 
+# ---------------- Dynamo（ROUTER=dynamo，只在节点0）----------------
+USE_DYNAMO=0
+if [[ $ROUTER == dynamo && $NODE_RANK == 0 ]]; then
+  USE_DYNAMO=1
+  # 前端和 worker 都在节点0：服务发现用本机目录，请求、响应和事件都走本机回环地址
+  export DYN_DISCOVERY_BACKEND=file DYN_FILE_KV="$HERE/logs/dynamo_discovery"
+  export DYN_REQUEST_PLANE=tcp DYN_TCP_RPC_HOST=127.0.0.1 DYN_TCP_RESPONSE_STREAM_HOST=127.0.0.1 DYN_EVENT_PLANE_HOST=127.0.0.1
+  export DYN_SYSTEM_PORT="$WORKER_SYSTEM_PORT" DYN_LOG="${DYN_LOG:-info}"
+  FRONT_ARGS=(
+    --http-host 0.0.0.0
+    --http-port "$HTTP_PORT"
+    --router-mode kv                                   # 新会话按各组的前缀缓存命中和负载选组
+    --router-session-affinity-ttl-secs "$SESSION_TTL"  # 带会话头的请求固定在该会话第一次选中的组
+    --enable-anthropic-api                             # 和 SGLang 一样提供 /v1/messages
+  )
+  # GLM-5.3 的工具调用和思考内容由前端解析；清前缀缓存用 POST <节点0>:$WORKER_SYSTEM_PORT/engine/flush_cache
+  ARGS+=(--dyn-tool-call-parser glm47 --dyn-reasoning-parser glm45 --engine-route flush_cache)
+  # 前端跨 NUMA 节点运行会明显变慢（Dynamo 启动时会告警）：多 NUMA 的机器上把它绑到网卡所在的 NUMA 节点
+  FRONT_PIN=()
+  numa="$(cat "/sys/class/infiniband/${IB_HCA}/device/numa_node" 2>/dev/null || echo 0)"
+  [[ $numa =~ ^[0-9]+$ ]] || numa=0
+  cpus="$(cat "/sys/devices/system/node/node${numa}/cpulist" 2>/dev/null || true)"
+  if [[ -n $cpus && -e /sys/devices/system/node/node1 ]] && command -v taskset >/dev/null; then
+    FRONT_PIN=(taskset -c "$cpus")
+    info "Dynamo 前端绑到 NUMA 节点 ${numa}（CPU ${cpus}）"
+  fi
+fi
+
 # ---------------- 打印并启动 ----------------
 mkdir -p "$HERE/logs"
-LOG="$HERE/logs/glm53_node${NODE_RANK}_${MODE}_$(date +%Y%m%d_%H%M%S).log"
+STAMP="$(date +%Y%m%d_%H%M%S)"
+LOG="$HERE/logs/glm53_node${NODE_RANK}_${MODE}_${STAMP}.log"
 
-info "节点 ${NODE_RANK} / 模式 ${MODE} / 注意力 ${ATTN_MODE}（${ATTN_DP} 组）/ KV ${KV_DTYPE} / MTP ${MTP}"
-if [[ $NODE_RANK == 0 ]]; then
+info "节点 ${NODE_RANK} / 模式 ${MODE} / 注意力 ${ATTN_MODE}（${ATTN_DP} 组）/ KV ${KV_DTYPE} / MTP ${MTP} / HiCache ${HICACHE} / 入口 ${ROUTER}"
+if ((USE_DYNAMO)); then
+  info "本机负责第一级流水 + Dynamo 前端：http://${NODE0_ADDR}:${HTTP_PORT}（会话空闲 ${SESSION_TTL}s 后解除固定）"
+  info "SGLang 的 /metrics 在 http://${NODE0_ADDR}:${WORKER_SYSTEM_PORT}/metrics，前端自己的在 HTTP_PORT 上"
+elif [[ $NODE_RANK == 0 ]]; then
   info "本机负责第一级流水 + HTTP 服务：http://${NODE0_ADDR}:${HTTP_PORT}"
 else
   info "本机负责第二级流水，不提供 HTTP；服务在 http://${NODE0_ADDR}:${HTTP_PORT}"
 fi
 info "NCCL 环境："
 print_nccl_env
+
+print_cmd() {  # print_cmd <命令> <参数...>：每个 -- 参数起一行，--api-key 的值打码
+  local line="    $1" a mask_next=0
+  shift
+  for a in "$@"; do
+    if ((mask_next)); then a="***"; mask_next=0; fi
+    [[ $a == --api-key ]] && mask_next=1
+    if [[ $a == --* ]]; then
+      printf '%s \\\n' "$line"
+      line="      $a"
+    elif [[ $a =~ ^[A-Za-z0-9_./:,=+-]+$ ]]; then
+      line+=" $a"
+    elif [[ $a != *"'"* ]]; then
+      line+=" '$a'"
+    else
+      line+=" $(printf '%q' "$a")"
+    fi
+  done
+  printf '%s\n' "$line"
+}
 info "启动命令："
-masked=() mask_next=0
-for a in "${ARGS[@]}"; do
-  if ((mask_next)); then masked+=("***"); mask_next=0; else masked+=("$a"); fi
-  [[ $a == --api-key ]] && mask_next=1
-done
-line='    python3 -m sglang.launch_server'
-for a in "${masked[@]}"; do
-  if [[ $a == --* ]]; then
-    printf '%s \\\n' "$line"
-    line="      $a"
-  elif [[ $a =~ ^[A-Za-z0-9_./:,=+-]+$ ]]; then
-    line+=" $a"
-  elif [[ $a != *"'"* ]]; then
-    line+=" '$a'"
-  else
-    line+=" $(printf '%q' "$a")"
-  fi
-done
-printf '%s\n' "$line"
+if ((USE_DYNAMO)); then
+  print_cmd "${FRONT_PIN[*]}${FRONT_PIN[*]:+ }$DYN_PY -m dynamo.frontend" "${FRONT_ARGS[@]}"
+  print_cmd "$DYN_PY $HERE/dynamo_worker.py" "${ARGS[@]}"
+else
+  print_cmd "python3 -m sglang.launch_server" "${ARGS[@]}"
+fi
 
 if [[ $DRY_RUN == 1 ]]; then
   info "DRY_RUN=1，不启动"
   exit 0
 fi
 info "日志：$LOG"
-python3 -m sglang.launch_server "${ARGS[@]}" 2>&1 | tee "$LOG"
+if ((USE_DYNAMO)); then
+  FLOG="$HERE/logs/dynamo_frontend_${MODE}_${STAMP}.log"
+  info "Dynamo 前端日志：$FLOG"
+  rm -rf "$DYN_FILE_KV"  # 上次留下的注册信息会让前端去连已经退出的 worker
+  "${FRONT_PIN[@]}" "$DYN_PY" -m dynamo.frontend "${FRONT_ARGS[@]}" >"$FLOG" 2>&1 &
+  FE_PID=$!
+  # 前端一退出服务就断了：这时像按 Ctrl-C 一样停掉整个进程组（worker 和调用本脚本的 deploy.sh）
+  (
+    while kill -0 "$FE_PID" 2>/dev/null; do sleep 5; done
+    warn "Dynamo 前端退出了（日志 $FLOG），停止服务"
+    kill -INT 0
+  ) &
+  WATCH_PID=$!
+  trap 'kill "$WATCH_PID" "$FE_PID" 2>/dev/null || true' EXIT
+  "$DYN_PY" "$HERE/dynamo_worker.py" "${ARGS[@]}" 2>&1 | tee "$LOG"
+else
+  python3 -m sglang.launch_server "${ARGS[@]}" 2>&1 | tee "$LOG"
+fi
